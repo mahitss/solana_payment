@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: citerail
+    env: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: DATABASE_URL
+        value: postgresql://neondb_owner:npg_7sZlAS4TgzFC@ep-tiny-sea-bfvq66w1-pooler.c-5.us-west-2.aws.neon.tech/neondb?sslmode=require
+      - key: NEXT_PUBLIC_SOLANA_RPC_URL
+        value: https://api.devnet.solana.com
+      - key: NEXT_PUBLIC_SOLANA_NETWORK
+        value: devnet
+      - key: NEXT_PUBLIC_USDC_MINT
+        value: 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
+      - key: NEXT_PUBLIC_MEMO_PROGRAM_ID
+        value: MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr
+      - key: OLLAMA_BASE_URL
+        value: http://127.0.0.1:11434
+      - key: OLLAMA_MODEL
+        value: gemma3:4b
