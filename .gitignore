@@ -23,5 +23,8 @@ yarn-debug.log*
 yarn-error.log*
 
 # local env files
+.env
 .env*.local
-# keep .env for hackathon/demo execution or template in repo, but never commit secret keys
+.env.development.local
+.env.test.local
+.env.production.local
