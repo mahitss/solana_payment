@@ -4,19 +4,14 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { WalletProvider, useWallet } from '@/components/WalletContext';
 import {
   Search,
-  BookOpen,
-  DollarSign,
   ShieldCheck,
   ExternalLink,
   UploadCloud,
-  FileText,
   Clock,
   Sparkles,
-  Layers,
   ArrowRight,
   CheckCircle2,
   AlertCircle,
-  Copy,
   Terminal,
 } from 'lucide-react';
 
@@ -861,6 +856,13 @@ function CiteRailDashboard() {
             </div>
 
             {/* Revenue Overview Card */}
+            {isLoadingPublisher && !publisherData && (
+              <div className="flex items-center justify-center gap-3 py-8 text-sm text-gray-400">
+                <div className="h-4 w-4 border-2 border-purple-500/30 border-t-purple-400 rounded-full animate-spin" />
+                Loading your royalty ledger...
+              </div>
+            )}
+
             {publisherData && (
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div className="bg-[#10121b] border border-gray-800 rounded-2xl p-5">

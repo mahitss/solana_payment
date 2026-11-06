@@ -4,9 +4,8 @@ import React, {
   createContext,
   useCallback,
   useContext,
-  useEffect,
   useMemo,
-  useState,
+  useSyncExternalStore,
 } from 'react';
 import {
   Connection,
@@ -70,34 +69,96 @@ function getProvider(): any {
   return (window as any).solana ?? null;
 }
 
-export function WalletProvider({ children }: { children: React.ReactNode }) {
-  const [publicKey, setPublicKey] = useState<string | null>(null);
+/* ------------------------------------------------------------------ */
+/* External wallet store                                                */
+/* ------------------------------------------------------------------ */
 
+/**
+ * The connected wallet lives outside React - inside the browser wallet
+ * extension. Modelling it as an external store lets the provider read it with
+ * `useSyncExternalStore`, which is the React-recommended way to consume a
+ * mutable external source.
+ *
+ * The two rejected alternatives both have real bugs:
+ *   - `setState` inside an effect triggers a cascading render on mount, and
+ *   - reading the provider during the initial render breaks hydration,
+ *     because the server render has no wallet extension at all.
+ */
+type WalletListener = () => void;
+
+const walletListeners = new Set<WalletListener>();
+
+/** The last known wallet address. `null` means disconnected. */
+let storePublicKey: string | null = null;
+
+/** Guards against binding the provider's listeners more than once. */
+let providerBound = false;
+
+function notifyWalletListeners(): void {
+  walletListeners.forEach((listener) => listener());
+}
+
+function readProviderKey(): string | null {
+  const provider = getProvider();
+  if (provider?.isConnected && provider.publicKey) {
+    return provider.publicKey.toString();
+  }
+  return null;
+}
+
+function subscribeToWallet(listener: WalletListener): () => void {
+  walletListeners.add(listener);
+
+  const provider = getProvider();
+  if (provider && !providerBound) {
+    providerBound = true;
+
+    provider.on?.('accountChanged', (account: any) => {
+      storePublicKey = account ? account.toString() : null;
+      notifyWalletListeners();
+    });
+
+    provider.on?.('disconnect', () => {
+      storePublicKey = null;
+      notifyWalletListeners();
+    });
+  }
+
+  // Pick up a connection that was already established before this page load.
+  const existing = readProviderKey();
+  if (existing !== storePublicKey) {
+    storePublicKey = existing;
+    notifyWalletListeners();
+  }
+
+  return () => {
+    walletListeners.delete(listener);
+  };
+}
+
+function getWalletSnapshot(): string | null {
+  return storePublicKey;
+}
+
+/**
+ * The server has no wallet extension, so the server-side render is always the
+ * disconnected state. Keeping this explicit guarantees that the first client
+ * render matches the server HTML before the store picks up a live connection.
+ */
+function getServerWalletSnapshot(): string | null {
+  return null;
+}
+
+export function WalletProvider({ children }: { children: React.ReactNode }) {
   // Restore an existing Phantom connection and keep the UI in sync with the
   // wallet. Previously the app only read `isConnected` once on mount, so
   // disconnecting or switching accounts inside Phantom left the dashboard
   // showing a stale, connected wallet.
-  useEffect(() => {
-    const provider = getProvider();
-    if (!provider) return;
-
-    if (provider.isConnected && provider.publicKey) {
-      setPublicKey(provider.publicKey.toString());
-    }
-
-    const handleAccountChanged = (account: any) => {
-      setPublicKey(account ? account.toString() : null);
-    };
-    const handleDisconnect = () => setPublicKey(null);
-
-    provider.on?.('accountChanged', handleAccountChanged);
-    provider.on?.('disconnect', handleDisconnect);
-
-    return () => {
-      provider.off?.('accountChanged', handleAccountChanged);
-      provider.off?.('disconnect', handleDisconnect);
-    };
-  }, []);
+  const publicKey = useSyncExternalStore(
+    subscribeToWallet,
+    getWalletSnapshot,
+    getServerWalletSnapshot
+  );
 
   const connectWallet = useCallback(async (): Promise<string | null> => {
     if (typeof window === 'undefined') return null;
@@ -112,7 +173,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     try {
       const resp = await provider.connect();
       const pubkey = resp.publicKey.toString();
-      setPublicKey(pubkey);
+      storePublicKey = pubkey;
+      notifyWalletListeners();
       return pubkey;
     } catch (err: any) {
       console.error('Wallet connection error:', err);
@@ -125,7 +187,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     if (provider) {
       provider.disconnect?.();
     }
-    setPublicKey(null);
+    storePublicKey = null;
+    notifyWalletListeners();
   }, []);
 
   const signMessage = useCallback(async (message: string): Promise<string> => {

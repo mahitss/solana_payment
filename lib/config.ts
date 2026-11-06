@@ -60,7 +60,6 @@ export function getAuthSecret(): string {
     );
   }
 
-  // eslint-disable-next-line no-console
   console.warn(
     '[config] AUTH_SECRET not set - using an ephemeral development secret. ' +
       'Sessions will be invalidated on restart. Set AUTH_SECRET before deploying.'
