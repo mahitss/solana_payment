@@ -697,7 +697,7 @@ await test('validateParsedSettlementTransaction: underpayment rejected', () => {
           price_per_query_usdc: '0.050000',
           chunk_index: 0,
           content: 'Dummy chunk',
-          content_hash: 'hash123',
+          content_hash: computeSha256('Dummy chunk'),
           token_count: 10,
         },
       ] as any);
