@@ -21,8 +21,8 @@ import {
 
 interface PublisherPayout {
   publisher_wallet: string;
-  amount_usdc: number;
-  amount_base_units: number;
+  amount_usdc: string;
+  amount_base_units: string;
 }
 
 interface WalletContextType {
@@ -282,8 +282,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
           );
         }
 
-        const amount = BigInt(Math.max(0, Math.round(item.amount_base_units)));
-        if (amount === 0n) {
+        const amount = BigInt(item.amount_base_units);
+        if (amount === 0n || amount < 0n) {
           throw new Error(
             `Invalid payout amount for publisher ${item.publisher_wallet}.`
           );

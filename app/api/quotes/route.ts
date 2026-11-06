@@ -78,10 +78,17 @@ export async function POST(req: Request) {
         id: quote.id,
         quoteNonce: quote.quote_nonce,
         totalPriceUsdc: quote.total_price_usdc,
-        totalBaseUnits: quote.total_base_units,
+        totalBaseUnits: quote.total_base_units.toString(),
         memoExpected: quote.memo_expected,
         expiresAt: quote.expires_at,
-        publisherBreakdown: quote.publisher_breakdown,
+        publisherBreakdown: quote.publisher_breakdown.map((p) => ({
+          ...p,
+          amount_base_units: p.amount_base_units.toString(),
+          documents: p.documents.map((d) => ({
+            ...d,
+            amount_base_units: d.amount_base_units.toString(),
+          })),
+        })),
       },
       sourcesPreview,
     });

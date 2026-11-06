@@ -418,19 +418,40 @@ async function generateAndRecord(
 }
 
 function serialiseReceipt(row: any) {
+  const breakdown = parseMaybeJson(row.breakdown);
   return {
     id: row.id,
     txSignature: row.tx_signature,
     payerWallet: row.payer_wallet,
-    totalAmountUsdc: parseFloat(row.total_amount_usdc),
-    totalBaseUnits: Number(row.settlement_amount_base_units ?? 0),
+    totalAmountUsdc: String(receiptTotalUsdc(row.total_amount_usdc)),
+    totalBaseUnits: String(receiptTotalBaseUnits(row.settlement_amount_base_units)),
     settlementAsset: row.settlement_asset || SETTLEMENT_ASSET,
     slot: Number(row.solana_slot),
     blockTime: row.block_time,
     memoVerified: row.memo_verified,
-    breakdown: parseMaybeJson(row.breakdown),
+    breakdown: breakdown.map((b: any) => ({
+      ...b,
+      expected_amount: String(b.expected_amount),
+      received_amount: String(b.received_amount),
+      documents: b.documents?.map((d: any) => ({
+        ...d,
+        amount_base_units: String(d.amount_base_units),
+      })) ?? [],
+    })),
     solanaExplorerUrl: `https://explorer.solana.com/tx/${row.tx_signature}?cluster=devnet`,
   };
+}
+
+/** Convert a stored NUMERIC USDC amount to a decimal string. */
+function receiptTotalUsdc(value: any): string {
+  if (value === null || value === undefined) return '0.000000';
+  return String(value);
+}
+
+/** Convert a stored BIGINT base-units amount to a decimal string. */
+function receiptTotalBaseUnits(value: any): string {
+  if (value === null || value === undefined) return '0';
+  return String(value);
 }
 
 function parseMaybeJson(value: any): any {

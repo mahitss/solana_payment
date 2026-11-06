@@ -26,8 +26,8 @@ interface MatchedSourcePreview {
 interface QuoteData {
   id: string;
   quoteNonce: string;
-  totalPriceUsdc: number;
-  totalBaseUnits: number;
+  totalPriceUsdc: string;
+  totalBaseUnits: string;
   memoExpected: string;
   expiresAt: string;
   publisherBreakdown: Array<{
@@ -36,8 +36,15 @@ interface QuoteData {
     publisher_name: string;
     document_title: string;
     chunk_ids: string[];
-    amount_usdc: number;
-    amount_base_units: number;
+    amount_usdc: string;
+    amount_base_units: string;
+    documents: Array<{
+      document_id: string;
+      document_title: string;
+      chunk_ids: string[];
+      amount_usdc: string;
+      amount_base_units: string;
+    }>;
   }>;
 }
 
@@ -691,7 +698,7 @@ function CiteRailDashboard() {
                   <div className="flex items-center justify-between border-t border-gray-800 pt-3">
                     <span className="font-semibold text-base text-gray-200">Total Royalty Settlement:</span>
                     <span className="font-mono font-extrabold text-xl text-emerald-400">
-                      ${quote.totalPriceUsdc.toFixed(4)} USDC
+                      ${quote.totalPriceUsdc} USDC
                     </span>
                   </div>
                 </div>

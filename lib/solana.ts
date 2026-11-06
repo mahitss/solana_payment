@@ -21,8 +21,8 @@ export interface ReceiptRecord {
   quote_id: string;
   tx_signature: string;
   payer_wallet: string;
-  total_amount_usdc: number;
-  total_base_units: number;
+  total_amount_usdc: string;
+  total_base_units: string;
   settlement_asset: string;
   solana_slot: number;
   block_time: string;
@@ -417,8 +417,8 @@ export async function verifySettlementTransaction(
     publisher_name: string;
     document_ids: string[];
     document_titles: string[];
-    expected_amount: bigint;
-    received_amount: bigint;
+    expected_amount: string;
+    received_amount: string;
     verified: boolean;
   }> = [];
 
@@ -452,8 +452,8 @@ export async function verifySettlementTransaction(
       publisher_name: pub.publisher_name,
       document_ids: allDocumentIds,
       document_titles: allDocumentTitles,
-      expected_amount: expectedAmount,
-      received_amount: amountReceivedForPub,
+      expected_amount: String(expectedAmount),
+      received_amount: String(amountReceivedForPub),
       verified: true,
     });
   }
@@ -498,7 +498,7 @@ export async function verifySettlementTransaction(
       quote.id,
       cleanSig,
       feePayer,
-      formatUsdc(quote.total_base_units),
+      formatUsdc(BigInt(quote.total_base_units)),
       SETTLEMENT_ASSET,
       quote.total_base_units,
       tx.slot,
@@ -538,7 +538,7 @@ export async function verifySettlementTransaction(
           item.publisher_name,
           item.document_ids,
           item.received_amount,
-          formatUsdc(item.received_amount),
+          formatUsdc(BigInt(item.received_amount)),
           SETTLEMENT_ASSET,
           cleanSig,
           new Date(blockTimeSec * 1000).toISOString(),
@@ -554,16 +554,16 @@ export async function verifySettlementTransaction(
     quote_id: receipt.quote_id,
     tx_signature: receipt.tx_signature,
     payer_wallet: receipt.payer_wallet,
-    total_amount_usdc: parseFloat(receipt.total_amount_usdc),
-    total_base_units: Number(receipt.settlement_amount_base_units),
+    total_amount_usdc: String(receipt.total_amount_usdc ?? '0'),
+    total_base_units: String(receipt.settlement_amount_base_units ?? '0'),
     settlement_asset: receipt.settlement_asset,
     solana_slot: Number(receipt.solana_slot),
     block_time: receipt.block_time,
     memo_verified: receipt.memo_verified,
     breakdown: verifiedBreakdown.map((b) => ({
       ...b,
-      expected_amount: Number(b.expected_amount),
-      received_amount: Number(b.received_amount),
+      expected_amount: String(b.expected_amount),
+      received_amount: String(b.received_amount),
     })),
     created_at: receipt.created_at,
   };
