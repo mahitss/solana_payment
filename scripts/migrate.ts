@@ -167,9 +167,15 @@ async function migrate() {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_quote_sources_quote_ordinal
         ON payment_quote_sources(quote_id, ordinal);
     `);
+    // Replace the old global unique index on chunk_id with a composite one
+    // scoped to (quote_id, chunk_id), so the same source chunk can be priced
+    // in multiple quotes.
     await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_quote_sources_chunk
-        ON payment_quote_sources(chunk_id);
+      DROP INDEX IF EXISTS idx_quote_sources_chunk;
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_quote_sources_quote_chunk
+        ON payment_quote_sources(quote_id, chunk_id);
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_quote_sources_quote
