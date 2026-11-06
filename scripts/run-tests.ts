@@ -1,6 +1,7 @@
 import assert from 'assert';
 import crypto from 'crypto';
-import { PublicKey } from '@solana/web3.js';
+import { PublicKey, ParsedTransactionWithMeta } from '@solana/web3.js';
+import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 
 import { chunkText, computeSha256, parseMarkdown } from '../lib/chunker';
 import { isValidSolanaAddress } from '../lib/auth';
@@ -19,7 +20,11 @@ import {
   parseNumericPrice,
 } from '../lib/protocol';
 import { createPaymentQuote, getQuote, getQuoteSources } from '../lib/quotes';
-import { verifySettlementTransaction, SolanaVerificationError } from '../lib/solana';
+import {
+  verifySettlementTransaction,
+  SolanaVerificationError,
+  validateParsedSettlementTransaction,
+} from '../lib/solana';
 import { buildGroundedPrompt, extractCitations } from '../lib/ai/provider';
 import { searchKnowledgeCollections } from '../lib/retrieval';
 import { query, pool } from '../lib/db';
@@ -295,6 +300,288 @@ async function runSuite() {
     assert.strictEqual(citations[0].citation_index, 1);
     assert.strictEqual(citations[0].chunk_id, 'chk_1');
   });
+
+// ============================================================================
+// TASK 7: Parsed transaction fixtures for payment verification testing
+// ============================================================================
+
+/**
+ * Settlement fixtures must use REAL Solana addresses.
+ *
+ * The verifier derives the payer's associated token account (ATA) from the fee
+ * payer and the configured USDC mint, and then requires every credited account
+ * to be the publisher's real ATA. A made-up base58 string is not a 32-byte
+ * public key and cannot even be constructed, so the fixtures below derive
+ * their accounts the same way the verifier does.
+ */
+const USDC_MINT = new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU');
+const MEMO_PROGRAM = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
+const TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+
+/** Builds a minimal parsed transaction fixture for settlement verification. */
+function makeParsedTx(params: {
+  feePayer: string;
+  buyerAta: string;
+  memoText: string | null;
+  transfers: Array<{
+    source: string;
+    destination: string;
+    amount: string;
+    mint: string | null;
+  }>;
+  tokenBalances: Array<{
+    accountIndex: number;
+    mint: string;
+    owner: string;
+    pre: string;
+    post: string;
+  }>;
+  blockTime?: number;
+  err: any;
+}): ParsedTransactionWithMeta {
+  const accountKeys: Array<{ pubkey: PublicKey }> = [
+    { pubkey: new PublicKey(params.feePayer) },
+    { pubkey: new PublicKey(params.buyerAta) },
+  ];
+
+  // Add publisher ATAs as account keys
+  const pubATAs = [...new Set(params.transfers.map((t) => t.destination))];
+  for (const a of pubATAs) {
+    if (accountKeys.some((k) => k.pubkey.toBase58() === a)) continue;
+    accountKeys.push({ pubkey: new PublicKey(a) });
+  }
+
+  const instructions: any[] = [];
+
+  // The memo instruction binds the transaction to the quote.
+  if (params.memoText !== null) {
+    instructions.push({
+      programId: MEMO_PROGRAM,
+      parsed: params.memoText,
+    });
+  }
+
+  // The SPL transfer instructions. The verifier reads the parsed instruction
+  // *and* the pre/post token balance metadata, so both are represented here.
+  // Without these the verifier correctly sees no transfer at all.
+  for (const transfer of params.transfers) {
+    instructions.push({
+      programId: TOKEN_PROGRAM,
+      program: 'spl-token',
+      parsed: {
+        type: transfer.mint ? 'transferChecked' : 'transfer',
+        info: transfer.mint
+          ? {
+              source: transfer.source,
+              destination: transfer.destination,
+              mint: transfer.mint,
+              tokenAmount: { amount: transfer.amount, decimals: 6 },
+            }
+          : {
+              source: transfer.source,
+              destination: transfer.destination,
+              amount: transfer.amount,
+            },
+      },
+    });
+  }
+
+  const message: any = {
+    accountKeys,
+    instructions,
+  };
+
+  const tx: ParsedTransactionWithMeta = {
+    transaction: {
+      message,
+      signatures: [],
+    },
+    meta: {
+      err: params.err,
+      fee: 5000,
+      preBalances: [1000000000, 500000000],
+      postBalances: [999950000, 500005000],
+      preTokenBalances: params.tokenBalances.map((b) => ({
+        accountIndex: b.accountIndex,
+        mint: b.mint,
+        owner: b.owner,
+        uiTokenAmount: { amount: b.pre, decimals: 6, uiAmount: Number(b.pre) / 1_000_000 },
+      })),
+      postTokenBalances: params.tokenBalances.map((b) => ({
+        accountIndex: b.accountIndex,
+        mint: b.mint,
+        owner: b.owner,
+        uiTokenAmount: { amount: b.post, decimals: 6, uiAmount: Number(b.post) / 1_000_000 },
+      })),
+    },
+    blockTime: params.blockTime,
+    slot: 12345,
+  };
+
+  return tx;
+}
+
+/** Builds a valid payment transaction fixture. */
+function makeValidTx(overrides: Partial<Parameters<typeof makeParsedTx>[0]> = {}): ParsedTransactionWithMeta {
+  const buyerKeypair = crypto.generateKeyPairSync('ed25519');
+  const buyerRaw = buyerKeypair.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  const buyerWallet = overrides.feePayer || new PublicKey(buyerRaw).toBase58();
+  const buyerAta = getAssociatedTokenAddressSync(new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'), new PublicKey(VALID_ADDRESS)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'), new PublicKey('9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin')).toBase58();
+
+  return makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_test:nonce123:digest456',
+    transfers: [
+      {
+        source: buyerAta,
+        destination: pubAta,
+        amount: '50000',
+        mint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
+      },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+    ...overrides,
+  });
+}
+
+// ============================================================================
+// END TASK 7 fixtures
+// ============================================================================
+
+// TASK 7: Regression tests using parsed transaction fixtures
+await test('validateParsedSettlementTransaction: valid exact payment to one publisher', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote: any = {
+    id: 'q_test',
+    buyer_wallet: buyerWallet,
+    memo_expected: 'CITERAIL:QUOTE:q_test:nonce123:digest456',
+    publisher_breakdown: [
+      {
+        publisher_id: 'pub_1',
+        publisher_wallet: pubWallet,
+        publisher_name: 'Pub One',
+        documents: [
+          {
+            document_id: 'doc_1',
+            document_title: 'Doc One',
+            chunk_ids: ['chk_1'],
+            amount_base_units: '50000',
+            amount_usdc: '0.050000',
+          },
+        ],
+        amount_base_units: '50000',
+        amount_usdc: '0.050000',
+      },
+    ],
+    total_base_units: '50000',
+  };
+
+  const buyerAta = getAssociatedTokenAddressSync(new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'), new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'), new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_test:nonce123:digest456',
+    transfers: [
+      {
+        source: buyerAta,
+        destination: pubAta,
+        amount: '50000',
+        mint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
+      },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  console.log('DEBUG buyerWallet:', buyerWallet);
+  console.log('DEBUG buyerAta:', buyerAta);
+  console.log('DEBUG pubWallet:', pubWallet);
+  console.log('DEBUG pubAta:', pubAta);
+  console.log('DEBUG tx.accountKeys:', tx.transaction.message.accountKeys.map(k => k.pubkey.toBase58()));
+
+  const result = validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  assert.strictEqual(result.valid, true);
+  assert.strictEqual(result.payer, buyerWallet);
+  assert.strictEqual(result.totalBaseUnits, 50000n);
+  assert.strictEqual(result.breakdown.length, 1);
+  assert.strictEqual(result.breakdown[0].received_amount, 50000n);
+});
+
+await test('validateParsedSettlementTransaction: underpayment rejected', () => {
+  const quote: any = {
+    id: 'q_test',
+    buyer_wallet: VALID_ADDRESS,
+    memo_expected: 'CITERAIL:QUOTE:q_test:nonce123:digest456',
+    publisher_breakdown: [
+      {
+        publisher_id: 'pub_1',
+        publisher_wallet: '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
+        publisher_name: 'Pub One',
+        documents: [
+          {
+            document_id: 'doc_1',
+            document_title: 'Doc One',
+            chunk_ids: ['chk_1'],
+            amount_base_units: '50000',
+            amount_usdc: '0.050000',
+          },
+        ],
+        amount_base_units: '50000',
+        amount_usdc: '0.050000',
+      },
+    ],
+    total_base_units: '50000',
+  };
+
+  const buyerAta = getAssociatedTokenAddressSync(new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'), new PublicKey(VALID_ADDRESS)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'), new PublicKey('9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin')).toBase58();
+
+  // Only 30000 base units transferred (underpayment)
+  const tx = makeParsedTx({
+    feePayer: VALID_ADDRESS,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_test:nonce123:digest456',
+    transfers: [
+      {
+        source: buyerAta,
+        destination: pubAta,
+        amount: '30000',
+        mint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
+      },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', owner: buyerAta, pre: '100000', post: '70000' },
+      { accountIndex: 2, mint: '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU', owner: pubAta, pre: '0', post: '30000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, VALID_ADDRESS);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'INSUFFICIENT_TRANSFER');
+  }
+  assert(threw, 'Underpayment should be rejected');
+});
+
   // ------------------------------------------------------------------
   // Database-backed tests
   // ------------------------------------------------------------------

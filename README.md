@@ -2,7 +2,7 @@
 
 **Licensed knowledge retrieval with verifiable, atomic creator royalties on Solana Devnet.**
 
-CiteRail is a Next.js 14 (App Router) + TypeScript application that sells access to a
+CiteRail is a Next.js 16 (App Router) + TypeScript application that sells access to a
 catalog of licensed documents. Publishers upload their work and set a per-query price;
 consumers ask a question, receive a price quote, pay with devnet USDC from Phantom, and
 only then receive a grounded answer with citations. Every settlement is verified
@@ -27,6 +27,16 @@ released, and the resulting receipt is publicly auditable.
   answer** — a quote is priced per publisher, the payment memo binds the transaction to
   the exact quote and source digest, the chain state is verified server-side, and the
   AI answer is produced only from the purchased chunks.
+- **Immutable source snapshots** — every priced chunk's exact text is snapshotted at
+  quote time and re-verified by SHA-256 at settlement, before *and* after the on-chain
+  check, so modified content can never be delivered under a valid receipt.
+- **Buyer-bound quotes** — a quote records the authenticated buyer, and only that
+  wallet can redeem the answer, so a third party who observes a transaction signature
+  cannot claim it.
+- **Prompt-injection isolation and fail-closed citations** — publisher content is
+  sanitised and delimited as untrusted data before it reaches the model, and an answer
+  without verifiable `[^N]` markers is withheld rather than published with fabricated
+  provenance.
 - **Atomic, idempotent settlement** — the receipt, the quote redemption and the
   normalised per-publisher payout ledger are written in one database transaction.
   Re-posting an already settled quote returns the existing receipt (regenerating the
@@ -60,7 +70,8 @@ released, and the resulting receipt is publicly auditable.
     |                                      |
     |                                      v
     |                            payment quote (expiry, per-publisher
-    |                            breakdown, memo payload)
+    |                            breakdown, memo payload, buyer binding
+    |                            + immutable source snapshots)
     |                                      |
     |                                      v
     |                            Phantom signs the memo + the USDC
@@ -70,6 +81,9 @@ released, and the resulting receipt is publicly auditable.
     |                            POST /api/settle { quoteId, txSignature }
     |                                      |
     |                                      v
+    |                            source integrity check (SHA-256 + digest)
+    |                                      |
+    |                                      v
     |                            on-chain verification (10 checks)
     |                                      |
     |                                      v
@@ -77,7 +91,8 @@ released, and the resulting receipt is publicly auditable.
     |                            + settlement_payouts royalty ledger
     |                                      |
     |                                      v
-    |                            AI grounding -> answer + citations + receipt
+    |                            source integrity re-check
+    |                            -> AI grounding -> answer + citations + receipt
     |                                      |
     +--------------------------------------+-------------------->  AUDITOR
                                                                    GET /api/receipts/:signature
@@ -100,8 +115,8 @@ per-publisher breakdown, the expected memo payload and the citations.
 
 | Layer | Technology |
 | --- | --- |
-| Framework | Next.js 14 (App Router), React 18, TypeScript 5.7 (strict) |
-| Runtime | Node.js 20 |
+| Framework | Next.js 16 (App Router), React 19, TypeScript 5.7 (strict) |
+| Runtime | Node.js 22 |
 | Database | PostgreSQL via Neon, accessed with `pg`; native FTS (`tsvector` / `ts_rank_cd`) |
 | Blockchain | Solana Devnet — `@solana/web3.js`, `@solana/spl-token` |
 | Settlement asset | SPL USDC on Devnet (6 decimals, integer base units) |
@@ -118,7 +133,7 @@ per-publisher breakdown, the expected memo payload and the citations.
 
 ### Prerequisites
 
-- **Node.js 20+**
+- **Node.js 22+**
 - **PostgreSQL 14+** — a local instance or a hosted one such as Neon. Hosted providers
   require `sslmode=require` in the connection string.
 - **Ollama** *(optional)* — a local Ollama server for grounded answers. Alternatively set
@@ -136,6 +151,15 @@ npm run db:migrate            # create the schema
 npm run db:seed               # optional: demo publishers and documents
 npm run dev                   # http://localhost:3000
 ```
+
+Other scripts:
+
+| Script | Purpose |
+| --- | --- |
+| `npm test` | Runs the test suite (44 tests). Database-backed tests are skipped automatically when `DATABASE_URL` is not set. Set `RUN_NETWORK_TESTS=1` to additionally exercise live Devnet verification. |
+| `npm run typecheck` | `tsc --noEmit`. |
+| `npm run lint` | ESLint (flat config, ESLint 9). |
+| `npm run verify:devnet` | Live Devnet check: RPC health, USDC mint decimals, Memo program executability and a settlement simulation. |
 
 For production:
 
@@ -180,8 +204,8 @@ with a meaningful HTTP status.
 | --- | --- | --- | --- |
 | `POST` | `/api/auth/challenge` | No | Issue a single-use nonce and the canonical message a wallet must sign. Body: `{ wallet }`. |
 | `POST` | `/api/auth/verify` | No | Verify the Ed25519 signature, burn the nonce and return a bearer session token. Body: `{ wallet, message, signature }`. |
-| `POST` | `/api/quotes` | No | Run full-text retrieval and return a payment quote (no payment is taken yet). Body: `{ query, buyerWallet }`. Returns `found: false` and no quote when nothing matches. |
-| `POST` | `/api/settle` | No | Verify an on-chain payment against a quote; on success return the grounded answer, citations and receipt. Body: `{ quoteId, txSignature, buyerWallet }`. Idempotent for an already-settled quote. |
+| `POST` | `/api/quotes` | **Yes** — `Authorization: Bearer <token>` | Run full-text retrieval and return a payment quote (no payment is taken yet). Body: `{ query }`. The buyer wallet is taken from the session token, never from the body, and is bound to the quote so only that wallet can redeem it. Returns `found: false` and no quote when nothing matches. |
+| `POST` | `/api/settle` | **Yes** — `Authorization: Bearer <token>` | Verify an on-chain payment against a quote; on success return the grounded answer, citations and receipt. Body: `{ quoteId, txSignature }`. The expected payer is derived from the session token, so a third party who observes a transaction signature cannot claim the answer. Idempotent for an already-settled quote. |
 | `POST` | `/api/documents` | **Yes** — `Authorization: Bearer <token>` | Ingest a PDF or Markdown document for the authenticated publisher. Accepts `multipart/form-data` or a JSON body. The publisher wallet is taken from the session token, never from the body. |
 | `GET` | `/api/documents` | No | Public catalogue listing. Optional `?limit=` (1–200, default 100). |
 | `GET` | `/api/publishers` | No | Public publisher directory (contact e-mail addresses are not exposed). |
@@ -190,9 +214,10 @@ with a meaningful HTTP status.
 | `GET` | `/api/receipts/:signature` | No | Public receipt verifier: settlement receipt, verified per-publisher breakdown, expected memo and citations for a transaction signature. |
 
 The bearer token is obtained from `POST /api/auth/verify` and must be sent as
-`Authorization: Bearer <token>`. For publisher write routes the token's wallet is the
-identity: it must match the wallet being credited, so a caller cannot publish under
-somebody else's address and collect their royalties.
+`Authorization: Bearer <token>`. For every authenticated route the token's wallet is the
+identity: it must match the wallet being credited or charged, so a caller cannot publish
+under somebody else's address, read another publisher's earnings, or redeem an answer
+that they did not pay for.
 
 ---
 
@@ -207,10 +232,10 @@ generate the answer and persist a receipt. The quote is marked `REDEEMED` and th
 receipt is written in a single database transaction, so a crash can never leave a quote
 redeemed without a matching receipt (or the other way around).
 
-### The seven verification checks
+### The ten verification checks
 
-Every settlement transaction is put through seven core checks before any content is
-served:
+Every settlement transaction is put through ten checks before any content is served.
+All of them fail closed: any doubt means the paid content is not released.
 
 1. **Signature format** — the supplied signature must be a plausible Solana transaction
    signature (length enforced) before any network call is made.
@@ -221,11 +246,12 @@ served:
    challenges, whose nonce is burned with a conditional `UPDATE` so two concurrent
    verifications cannot both succeed either.
 3. **On-chain success** — the transaction's `meta.err` must be null, i.e. the chain
-   actually executed it rather than aborting it.
+   actually executed it rather than aborting it. Missing metadata is rejected outright
+   rather than treated as success.
 4. **Quote expiry versus block time** — the transaction's block time is compared
    against the quote's expiry (with a 60-second clock tolerance). A payment mined after
    the quote expired is rejected with `QUOTE_EXPIRED`.
-5. **Payer match** — the transaction's fee payer must be the expected buyer wallet, so
+5. **Payer match** — the transaction's fee payer must be the authenticated buyer, so
    a third party cannot pay someone else's quote and claim the answer.
 6. **Exact memo binding** — a Memo program instruction must contain exactly the
    expected payload `CITERAIL:QUOTE:<quote_id>:<quote_nonce>:<source_digest>`. The
@@ -233,24 +259,44 @@ served:
    append extra data to the memo. The quote id, the per-quote nonce and the SHA-256
    digest of the priced chunk hashes together bind the payment to this quote and to
    precisely the sources that were priced.
-7. **Per-publisher transfer amount and mint check** — every publisher in the quote's
-   breakdown must have received at least their quoted amount, in USDC base units, at
-   their associated token account for the configured mint. Settlement is exclusively in
-   SPL USDC: native SOL transfers are not accepted, because comparing lamports against
-   USDC base units would let a 50,000-lamport transfer count as a $0.05 payment. The
-   mint is proven either from `transferChecked` or from the source ATA, and the
-   pre/post token balance delta is used as an independent cross-check.
-
-Three further settlement-integrity checks close the remaining gaps:
+7. **Per-publisher amount and mint check** — every publisher in the quote's breakdown
+   must have received **exactly** their quoted amount, in USDC base units, at their
+   associated token account for the configured mint. Underpayment *and* overpayment are
+   both rejected. Settlement is exclusively in SPL USDC: native SOL transfers are not
+   accepted, because comparing lamports against USDC base units would let a
+   50,000-lamport transfer count as a $0.05 payment. The mint is proven from the token
+   balance metadata of **both** the source and the destination account, so an
+   unchecked `transfer` cannot smuggle a different token through the same accounts.
 
 8. **No unexpected outflows** — every USDC transfer in the transaction must go to a
    publisher that was actually priced, so a buyer cannot bundle extra USDC outflows
    into the same atomic transaction.
-9. **The payer was debited** — the buyer's USDC balance must actually have fallen by
-   at least the quoted total.
-10. **The total covers the quote** — the sum of the verified per-publisher amounts must
-    be at least the quoted total, recomputed in integer base units from the breakdown
-    rather than trusted from the stored decimal.
+9. **No third-party funding** — a priced publisher's account may only be credited by
+   the buyer's own USDC account. A third party topping up a publisher's ATA inside the
+   same transaction is rejected with `THIRD_PARTY_FUNDING`.
+10. **The payer was debited exactly** — the buyer's USDC token account must have
+    fallen by exactly the quoted total, and the sum of the verified per-publisher
+    amounts must equal the quote total. Both are recomputed in integer base units from
+    the breakdown rather than trusted from the stored decimal, and any unexpected
+    incoming transfer to the buyer's account is rejected as well.
+
+### Source integrity is verified before and after settlement
+
+When a quote is priced, the exact text of every purchased chunk is written to an
+immutable `payment_quote_sources` snapshot table (write-once, never exposed through a
+public API). At settlement time the server:
+
+1. loads the quoted chunk IDs and checks the count matches exactly — no partial
+   fulfilment is possible;
+2. re-hashes every chunk's content with SHA-256 and compares it against the stored
+   hash, so modified content is detected;
+3. recomputes the combined source digest and compares it against the digest committed
+   to in the memo, proving the delivered sources are the priced sources; and
+4. repeats the hash and digest checks **after** the on-chain verification and before
+   the answer is generated, closing the window between verification and delivery.
+
+If any of these fail, no settlement is recorded (before) or the receipt is recorded
+but no answer is produced (after), and the consumer is told explicitly which happened.
 
 ### Money is handled as integers
 
@@ -277,20 +323,45 @@ Grounded generation is only attempted through a provider that has been positivel
 probed. If neither Gemini (configured `GEMINI_API_KEY`) nor Ollama (reachable at
 `OLLAMA_BASE_URL` with at least one model) responds, the provider factory throws and
 the request fails — no answer is invented, no partial answer is returned, and the
-payment is never silently "refunded" by pretending it succeeded. The grounding prompt
-also forbids citations outside the supplied chunk range and instructs the model to say
-so explicitly when the licensed sources do not contain enough information.
+payment is never silently "refunded" by pretending it succeeded. Outbound provider
+calls are also bounded by `AI_REQUEST_TIMEOUT_MS`, so a hung inference server cannot
+hold a request open indefinitely.
+
+**Prompt injection is neutralised.** Publisher documents are attacker-controlled, so
+every chunk is sanitised before it enters the prompt: ANSI escape sequences and
+control characters are stripped, zero-width characters are removed, Markdown
+structural prefixes (`>`, `#`) are collapsed, and lines that look like role or system
+instructions (`system:`, `ignore all previous instructions`, `you are now`, and
+similar) are prefixed with `[REDACTED-INSTRUCTION]`. Each source is then wrapped in
+explicit `---BEGIN/END UNTRUSTED SOURCE n---` delimiters — and any attempt to forge
+those delimiters inside the content is neutralised too — under a preamble that states
+the enclosed regions are untrusted data and must never be followed as instructions.
+The user query is sanitised the same way.
+
+**Citations fail closed.** The citation marker grammar is strict: only `[^N]` counts,
+and `N` must be within `1..N` for the number of sources actually supplied. A bare
+`[N]` is deliberately not accepted, because models emit it by accident and it
+collides with ordinary Markdown. If the model returns an answer with no valid
+citation marker, the request **fails** rather than publishing the answer with
+fabricated provenance — the previous behaviour silently marked every chunk as
+"cited", which would have presented ungrounded claims as verified. The grounding
+prompt also forbids citations outside the supplied chunk range and instructs the model
+to say so explicitly when the licensed sources do not contain enough information.
 
 ### Other measures
 
-- Publisher write routes (`POST /api/documents`, `POST /api/publishers`) and the
-  royalty dashboard derive the publisher identity from the **session token**, never
-  from the request body or a query parameter.
+- Every authenticated route (`POST /api/quotes`, `POST /api/settle`,
+  `POST /api/documents`, `POST /api/publishers`, `GET /api/publisher/economics`)
+  derives the wallet identity from the **session token**, never from the request
+  body or a query parameter. A quote is bound to the buyer at creation time, so only
+  the wallet that paid can redeem the answer.
 - Session tokens are HMAC-SHA256 signed envelopes compared with `timingSafeEqual`; the
   signing secret must be at least 32 characters and is mandatory in production.
 - Wallet addresses are validated as base58 public keys before they are stored or used.
 - Upload size and query length are bounded by `MAX_UPLOAD_BYTES` and
   `MAX_QUERY_LENGTH`, and queries that match nothing are never quoted or charged.
+- Retrieval enforces a relevance floor: a chunk is only priced if it actually matches
+  the query, and there is no fallback that returns unrelated recent content.
 - Every settlement receipt is public by design: the payment is provable on-chain, so
   the receipt, the per-publisher breakdown and the citations are readable by anyone
   holding the transaction signature.
