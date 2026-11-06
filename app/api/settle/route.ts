@@ -56,6 +56,17 @@ export async function POST(req: Request) {
       );
     }
 
+    // TASK 4: Enforce buyer ownership — only the quote's buyer can settle.
+    if (!quote.buyer_wallet || quote.buyer_wallet !== buyerWallet) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'This quote was not purchased by your wallet.',
+        },
+        { status: 403 }
+      );
+    }
+
     // TASK 2, item 8 & 9: Already-redeemed quotes return answers only to
     // their authenticated buyer.
     if (quote.status === 'REDEEMED') {
