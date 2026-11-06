@@ -215,6 +215,274 @@ function getTokenAccountDelta(
  * payment proof. All payment verification now uses per-token-account balance
  * deltas from transaction metadata.
  */
+export interface ValidatedSettlement {
+  valid: true;
+  payer: string;
+  totalBaseUnits: bigint;
+  breakdown: Array<{
+    publisher_id: string;
+    publisher_wallet: string;
+    publisher_name: string;
+    document_ids: string[];
+    document_titles: string[];
+    documents: Array<{
+      document_id: string;
+      document_title: string;
+      chunk_ids: string[];
+      amount_base_units: bigint;
+      amount_usdc: string;
+    }>;
+    expected_amount: bigint;
+    received_amount: bigint;
+    verified: boolean;
+  }>;
+}
+
+/**
+ * TASK 5: Pure validation of a parsed Solana transaction against a quote.
+ *
+ * This function contains all security-critical verification logic and can be
+ * tested independently of RPC and database access. It validates actual parsed
+ * transaction data and returns a structured verified settlement result.
+ *
+ * Checks performed:
+ *   1. Transaction metadata present
+ *   2. On-chain execution successful (meta.err === null)
+ *   3. Block time present and within quote expiry
+ *   4. Fee payer matches expectedPayer (if provided)
+ *   5. Memo instruction present and matches quote.memo_expected exactly
+ *   6. Every SPL transfer originates from buyer's USDC ATA
+ *   7. Every transfer to a priced publisher's ATA comes from buyer's ATA
+ *   8. No transfers from buyer ATA to unpriced destinations
+ *   9. No unexpected incoming transfers to buyer ATA
+ *   10. Mint verified via token-balance metadata (accountIndex → accountKeys)
+ *   11. Per-publisher amounts exact (no under/over payment)
+ *   12. Total transferred equals quote total (no under/over payment)
+ *   13. Payer USDC ATA debited by exactly quote total
+ *
+ * Does NOT perform: replay protection, signature format, RPC fetch,
+ * database persistence. Those are handled by verifySettlementTransaction.
+ */
+export function validateParsedSettlementTransaction(
+  tx: ParsedTransactionWithMeta,
+  quote: PaymentQuote,
+  expectedPayer?: string
+): ValidatedSettlement {
+  // Missing metadata
+  if (!tx.meta) {
+    throw new SolanaVerificationError(
+      'Transaction has no on-chain metadata.',
+      'TRANSACTION_NO_META'
+    );
+  }
+
+  // Failed transaction
+  if (tx.meta.err !== null) {
+    throw new SolanaVerificationError(
+      `Transaction failed on-chain with error: ${JSON.stringify(tx.meta.err)}`,
+      'TRANSACTION_FAILED'
+    );
+  }
+
+  // Missing block time
+  if (!tx.blockTime) {
+    throw new SolanaVerificationError(
+      'Transaction has no block time. Cannot verify quote expiry.',
+      'TRANSACTION_NO_BLOCK_TIME'
+    );
+  }
+
+  // Payer check
+  const feePayer = tx.transaction.message.accountKeys[0]?.pubkey.toBase58();
+  if (!feePayer) {
+    throw new SolanaVerificationError(
+      'Could not determine the transaction fee payer.',
+      'PAYER_MISSING'
+    );
+  }
+  if (expectedPayer && feePayer !== expectedPayer.trim()) {
+    throw new SolanaVerificationError(
+      `Transaction payer mismatch. Expected: ${expectedPayer}, got: ${feePayer}`,
+      'PAYER_MISMATCH'
+    );
+  }
+
+  // Quote expiry
+  const blockTimeSec = tx.blockTime;
+  const quoteExpiresTimeSec = Math.floor(new Date(quote.expires_at).getTime() / 1000);
+  if (blockTimeSec > quoteExpiresTimeSec + 60) {
+    throw new SolanaVerificationError(
+      `Quote ${quote.id} expired at ${quote.expires_at}, but transaction was mined at ${new Date(
+        blockTimeSec * 1000
+      ).toISOString()}`,
+      'QUOTE_EXPIRED'
+    );
+  }
+
+  // Memo check
+  const memoText = extractMemoFromParsedTx(tx);
+  if (!memoText) {
+    throw new SolanaVerificationError(
+      'Transaction does not contain a CiteRail memo instruction.',
+      'MEMO_MISSING'
+    );
+  }
+  if (memoText !== quote.memo_expected) {
+    throw new SolanaVerificationError(
+      `Transaction memo verification failed. Expected exactly "${quote.memo_expected}", got: "${memoText}"`,
+      'MEMO_MISMATCH'
+    );
+  }
+
+  // Transfer verification
+  const payerKey = new PublicKey(feePayer);
+  const payerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, payerKey);
+  const payerAtaStr = payerAta.toBase58();
+  const usdcMintStr = DEVNET_USDC_MINT.toBase58();
+
+  // Build expected destinations from quote breakdown
+  const expectedDestinations = new Map<string, string>();
+  for (const pub of quote.publisher_breakdown) {
+    const pubKey = new PublicKey(pub.publisher_wallet);
+    expectedDestinations.set(
+      getAssociatedTokenAddressSync(DEVNET_USDC_MINT, pubKey).toBase58(),
+      pub.publisher_wallet
+    );
+  }
+
+  const splTransfers = extractSplTransfers(tx);
+
+  // Validate every SPL transfer
+  for (const transfer of splTransfers) {
+    const destIsPriced = expectedDestinations.has(transfer.destination);
+
+    // Reject third-party funding to a priced publisher's ATA
+    if (destIsPriced && transfer.source !== payerAtaStr) {
+      throw new SolanaVerificationError(
+        `Third-party funding detected: transfer to ${transfer.destination} from non-buyer source ${transfer.source}.`,
+        'THIRD_PARTY_FUNDING'
+      );
+    }
+
+    // Skip transfers that don't involve our pricing
+    if (transfer.source !== payerAtaStr) continue;
+    if (!destIsPriced) continue;
+
+    // Verify source account mint is USDC via token-balance metadata
+    const sourceMint = getTokenAccountMint(tx, transfer.source);
+    if (sourceMint !== usdcMintStr) {
+      throw new SolanaVerificationError(
+        `Source account ${transfer.source} is not a USDC token account.`,
+        'WRONG_SOURCE_MINT'
+      );
+    }
+
+    // Verify destination account mint is USDC via token-balance metadata
+    const destMint = getTokenAccountMint(tx, transfer.destination);
+    if (destMint !== usdcMintStr) {
+      throw new SolanaVerificationError(
+        `Destination account ${transfer.destination} is not a USDC token account.`,
+        'WRONG_DESTINATION_MINT'
+      );
+    }
+  }
+
+  // Compute actual credited amounts from token balance deltas
+  const destinationDeltas = new Map<string, bigint>();
+  for (const transfer of splTransfers) {
+    if (transfer.source !== payerAtaStr) continue;
+    if (!expectedDestinations.has(transfer.destination)) continue;
+
+    const delta = getTokenAccountDelta(tx, transfer.destination);
+    if (delta > BigInt(0)) {
+      const existing = destinationDeltas.get(transfer.destination) ?? BigInt(0);
+      destinationDeltas.set(transfer.destination, existing + delta);
+    }
+  }
+
+  // Also check for unexpected incoming transfers to buyer ATA
+  const buyerIncomingDeltas = new Map<string, bigint>();
+  for (const transfer of splTransfers) {
+    if (transfer.destination !== payerAtaStr) continue;
+    if (transfer.source === payerAtaStr) continue;
+    const delta = getTokenAccountDelta(tx, transfer.destination);
+    if (delta > BigInt(0)) {
+      const existing = buyerIncomingDeltas.get(transfer.source) ?? BigInt(0);
+      buyerIncomingDeltas.set(transfer.source, existing + delta);
+    }
+  }
+  if (buyerIncomingDeltas.size > 0) {
+    const sources = Array.from(buyerIncomingDeltas.keys()).join(', ');
+    throw new SolanaVerificationError(
+      `Unexpected incoming transfers to buyer ATA from: ${sources}`,
+      'UNEXPECTED_INFLOW'
+    );
+  }
+
+  let totalTransferredBaseUnits = BigInt(0);
+  const verifiedBreakdown: ValidatedSettlement['breakdown'] = [];
+
+  for (const pub of quote.publisher_breakdown) {
+    const expectedAta = getAssociatedTokenAddressSync(
+      DEVNET_USDC_MINT,
+      new PublicKey(pub.publisher_wallet)
+    );
+    const expectedAtaStr = expectedAta.toBase58();
+
+    const amountReceivedForPub = destinationDeltas.get(expectedAtaStr) ?? BigInt(0);
+
+    const expectedAmount = BigInt(pub.amount_base_units);
+    if (amountReceivedForPub !== expectedAmount) {
+      throw new SolanaVerificationError(
+        `Incorrect ${SETTLEMENT_ASSET} amount for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected exactly ${expectedAmount} base units, received ${amountReceivedForPub} base units.`,
+        amountReceivedForPub < expectedAmount
+          ? 'INSUFFICIENT_TRANSFER'
+          : 'EXCESSIVE_TRANSFER'
+      );
+    }
+
+    totalTransferredBaseUnits += amountReceivedForPub;
+    verifiedBreakdown.push({
+      publisher_id: pub.publisher_id,
+      publisher_wallet: pub.publisher_wallet,
+      publisher_name: pub.publisher_name,
+      document_ids: pub.documents.flatMap((d) => d.document_id),
+      document_titles: pub.documents.map((d) => d.document_title),
+      documents: pub.documents,
+      expected_amount: expectedAmount,
+      received_amount: amountReceivedForPub,
+      verified: true,
+    });
+  }
+
+  // Exact total
+  if (totalTransferredBaseUnits !== BigInt(quote.total_base_units)) {
+    throw new SolanaVerificationError(
+      `Total settled amount ${totalTransferredBaseUnits} base units does not equal quoted total ${quote.total_base_units} base units.`,
+      totalTransferredBaseUnits < BigInt(quote.total_base_units)
+        ? 'INSUFFICIENT_TOTAL'
+        : 'EXCESSIVE_TOTAL'
+    );
+  }
+
+  // Exact payer debit
+  const payerAtaDelta = getTokenAccountDelta(tx, payerAtaStr);
+  const expectedPayerDebit = -BigInt(quote.total_base_units);
+  if (payerAtaDelta !== expectedPayerDebit) {
+    throw new SolanaVerificationError(
+      `Payer USDC ATA delta is ${payerAtaDelta} base units, but the quote requires exactly ${expectedPayerDebit} base units (debit of ${quote.total_base_units}).`,
+      'PAYER_NOT_DEBITED_EXACT'
+    );
+  }
+
+  return {
+    valid: true,
+    payer: feePayer,
+    totalBaseUnits: totalTransferredBaseUnits,
+    breakdown: verifiedBreakdown,
+  };
+}
+
 export async function verifySettlementTransaction(
   txSignature: string,
   quote: PaymentQuote,
@@ -262,230 +530,8 @@ export async function verifySettlementTransaction(
     );
   }
 
-  // 3. Verify on-chain execution status
-  if (tx.meta.err !== null) {
-    throw new SolanaVerificationError(
-      `Transaction failed on-chain with error: ${JSON.stringify(tx.meta.err)}`,
-      'TRANSACTION_FAILED'
-    );
-  }
-
-  // D. Never accept a missing block time as proof of timing.
-  if (!tx.blockTime) {
-    throw new SolanaVerificationError(
-      `Transaction ${cleanSig} has no block time. Cannot verify quote expiry.`,
-      'TRANSACTION_NO_BLOCK_TIME'
-    );
-  }
-
-  // 5. Verify Signer / Payer
-  const feePayer = tx.transaction.message.accountKeys[0]?.pubkey.toBase58();
-  if (!feePayer) {
-    throw new SolanaVerificationError(
-      'Could not determine the transaction fee payer.',
-      'PAYER_MISSING'
-    );
-  }
-  if (expectedPayer && feePayer !== expectedPayer.trim()) {
-    throw new SolanaVerificationError(
-      `Transaction payer mismatch. Expected: ${expectedPayer}, got: ${feePayer}`,
-      'PAYER_MISMATCH'
-    );
-  }
-
-  // 4. Verify Quote Expiry against Block Time
-  const blockTimeSec = tx.blockTime;
-  const quoteExpiresTimeSec = Math.floor(new Date(quote.expires_at).getTime() / 1000);
-
-  // Allow a 60 second clock tolerance
-  if (blockTimeSec > quoteExpiresTimeSec + 60) {
-    throw new SolanaVerificationError(
-      `Quote ${quote.id} expired at ${quote.expires_at}, but transaction was mined at ${new Date(
-        blockTimeSec * 1000
-      ).toISOString()}`,
-      'QUOTE_EXPIRED'
-    );
-  }
-
-  // 6. Verify Memo instruction matches quote.memo_expected exactly.
-  //    A substring match would let a buyer append arbitrary data to the memo,
-  //    which breaks the "exact digest match" guarantee the protocol promises.
-  const memoText = extractMemoFromParsedTx(tx);
-  if (!memoText) {
-    throw new SolanaVerificationError(
-      'Transaction does not contain a CiteRail memo instruction.',
-      'MEMO_MISSING'
-    );
-  }
-  if (memoText !== quote.memo_expected) {
-    throw new SolanaVerificationError(
-      `Transaction memo verification failed. Expected exactly "${quote.memo_expected}", got: "${memoText}"`,
-      'MEMO_MISMATCH'
-    );
-  }
-
-  // 7. Verify Royalty Transfers to Publishers.
-  //
-  //    CiteRail settles exclusively in SPL USDC. Native SOL transfers are not
-  //    accepted.
-  //
-  //    Every accepted transfer must:
-  //      - Originate from the buyer's USDC ATA (source)
-  //      - Go to a priced publisher's USDC ATA (destination)
-  //      - Have USDC as its mint (verified via token balance metadata, ground
-  //        truth from the Solana runtime)
-  //      - Match the exact expected amount per publisher (no underpayment,
-  //        no overpayment)
-  //
-  //    Instruction-parsed amounts are NOT trusted for unchecked `transfer`
-  //    instructions. Token balance deltas from pre/post metadata are the
-  //    authoritative source of truth.
-  const payerKey = new PublicKey(feePayer);
-  const payerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, payerKey);
-  const payerAtaStr = payerAta.toBase58();
-  const usdcMintStr = DEVNET_USDC_MINT.toBase58();
-
-  const splTransfers = extractSplTransfers(tx);
-
-  // Build expected destinations: publisher ATA → publisher wallet.
-  const expectedDestinations = new Map<string, string>();
-  for (const pub of quote.publisher_breakdown) {
-    const pubKey = new PublicKey(pub.publisher_wallet);
-    expectedDestinations.set(
-      getAssociatedTokenAddressSync(DEVNET_USDC_MINT, pubKey).toBase58(),
-      pub.publisher_wallet
-    );
-  }
-
-  // Validate every SPL transfer: source must be buyer's ATA, destination must
-  // be a priced publisher's ATA, both accounts must be USDC token accounts.
-  // Third-party funding (transfer to a priced publisher from a non-buyer
-  // source) is explicitly rejected.
-  for (const transfer of splTransfers) {
-    const destIsPriced = expectedDestinations.has(transfer.destination);
-
-    // Reject third-party funding to a priced publisher's ATA.
-    if (destIsPriced && transfer.source !== payerAtaStr) {
-      throw new SolanaVerificationError(
-        `Third-party funding detected: transfer to ${transfer.destination} from non-buyer source ${transfer.source}.`,
-        'THIRD_PARTY_FUNDING'
-      );
-    }
-
-    // Skip transfers that don't involve our pricing: wrong source or
-    // unpriced destination.
-    if (transfer.source !== payerAtaStr) continue;
-    if (!destIsPriced) continue;
-
-    // Verify source account mint is USDC via token balance metadata.
-    const sourceMint = getTokenAccountMint(tx, transfer.source);
-    if (sourceMint !== usdcMintStr) {
-      throw new SolanaVerificationError(
-        `Source account ${transfer.source} is not a USDC token account.`,
-        'WRONG_SOURCE_MINT'
-      );
-    }
-
-    // Verify destination account mint is USDC via token balance metadata.
-    const destMint = getTokenAccountMint(tx, transfer.destination);
-    if (destMint !== usdcMintStr) {
-      throw new SolanaVerificationError(
-        `Destination account ${transfer.destination} is not a USDC token account.`,
-        'WRONG_DESTINATION_MINT'
-      );
-    }
-  }
-
-  // Compute actual credited amounts from token balance deltas (ground truth),
-  // not instruction-parsed amounts.
-  const destinationDeltas = new Map<string, bigint>();
-  for (const transfer of splTransfers) {
-    if (transfer.source !== payerAtaStr) continue;
-    if (!expectedDestinations.has(transfer.destination)) continue;
-
-    const delta = getTokenAccountDelta(tx, transfer.destination);
-    if (delta > BigInt(0)) {
-      const existing = destinationDeltas.get(transfer.destination) ?? BigInt(0);
-      destinationDeltas.set(transfer.destination, existing + delta);
-    }
-  }
-
-  let totalTransferredBaseUnits = BigInt(0);
-  const verifiedBreakdown: Array<{
-    publisher_id: string;
-    publisher_wallet: string;
-    publisher_name: string;
-    document_ids: string[];
-    document_titles: string[];
-    documents: Array<{
-      document_id: string;
-      document_title: string;
-      chunk_ids: string[];
-      amount_base_units: bigint;
-      amount_usdc: string;
-    }>;
-    expected_amount: string;
-    received_amount: string;
-    verified: boolean;
-  }> = [];
-
-  for (const pub of quote.publisher_breakdown) {
-    const expectedAta = getAssociatedTokenAddressSync(
-      DEVNET_USDC_MINT,
-      new PublicKey(pub.publisher_wallet)
-    );
-    const expectedAtaStr = expectedAta.toBase58();
-
-    // Use token balance delta as the authoritative credited amount.
-    const amountReceivedForPub = destinationDeltas.get(expectedAtaStr) ?? BigInt(0);
-
-    // Enforce EXACT per-publisher amount: reject underpayment AND overpayment.
-    const expectedAmount = BigInt(pub.amount_base_units);
-    if (amountReceivedForPub !== expectedAmount) {
-      throw new SolanaVerificationError(
-        `Incorrect ${SETTLEMENT_ASSET} amount for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected exactly ${expectedAmount} base units, received ${amountReceivedForPub} base units.`,
-        amountReceivedForPub < expectedAmount
-          ? 'INSUFFICIENT_TRANSFER'
-          : 'EXCESSIVE_TRANSFER'
-      );
-    }
-
-    totalTransferredBaseUnits += amountReceivedForPub;
-    const allDocumentIds = pub.documents.flatMap((d) => d.document_id);
-    const allDocumentTitles = pub.documents.map((d) => d.document_title);
-    verifiedBreakdown.push({
-      publisher_id: pub.publisher_id,
-      publisher_wallet: pub.publisher_wallet,
-      publisher_name: pub.publisher_name,
-      document_ids: allDocumentIds,
-      document_titles: allDocumentTitles,
-      documents: pub.documents,
-      expected_amount: String(expectedAmount),
-      received_amount: String(amountReceivedForPub),
-      verified: true,
-    });
-  }
-
-  // 8. Verify EXACT total transferred: reject underpayment AND overpayment.
-  if (totalTransferredBaseUnits !== BigInt(quote.total_base_units)) {
-    throw new SolanaVerificationError(
-      `Total settled amount ${totalTransferredBaseUnits} base units does not equal the quoted total ${quote.total_base_units} base units.`,
-      totalTransferredBaseUnits < BigInt(quote.total_base_units)
-        ? 'INSUFFICIENT_TOTAL'
-        : 'EXCESSIVE_TOTAL'
-    );
-  }
-
-  // 9. Verify EXACT payer debit: the buyer's USDC ATA must be debited by
-  //    exactly the quote total (no more, no less).
-  const payerAtaDelta = getTokenAccountDelta(tx, payerAtaStr);
-  const expectedPayerDebit = -BigInt(quote.total_base_units);
-  if (payerAtaDelta !== expectedPayerDebit) {
-    throw new SolanaVerificationError(
-      `Payer USDC ATA delta is ${payerAtaDelta} base units, but the quote requires exactly ${expectedPayerDebit} base units (debit of ${quote.total_base_units}).`,
-      'PAYER_NOT_DEBITED_EXACT'
-    );
-  }
+  // Delegate all on-chain validation to the pure function.
+  const validated = validateParsedSettlementTransaction(tx, quote, expectedPayer);
 
   // 10. Atomic persistence: receipt, quote redemption and the normalised
   //     payout ledger are written in a single transaction.
@@ -505,13 +551,13 @@ export async function verifySettlementTransaction(
       receiptId,
       quote.id,
       cleanSig,
-      feePayer,
-      formatUsdc(BigInt(quote.total_base_units)),
+      validated.payer,
+      formatUsdc(validated.totalBaseUnits),
       SETTLEMENT_ASSET,
-      quote.total_base_units,
+      validated.totalBaseUnits,
       tx.slot,
-      new Date(blockTimeSec * 1000).toISOString(),
-      JSON.stringify(verifiedBreakdown),
+      new Date(tx.blockTime! * 1000).toISOString(),
+      JSON.stringify(validated.breakdown),
     ]);
 
     // Mark the quote redeemed. The conditional UPDATE means two concurrent
@@ -530,8 +576,8 @@ export async function verifySettlementTransaction(
 
     // Normalised payout ledger: one row per publisher per receipt, indexed so
     // per-publisher royalty accounting is a query rather than a table scan.
-    for (const item of verifiedBreakdown) {
-      const documentAllocations = item.documents.map((d) => ({
+    for (const item of validated.breakdown) {
+      const documentAllocations = item.documents.map((d: any) => ({
         document_id: d.document_id,
         document_title: d.document_title,
         amount_base_units: String(d.amount_base_units),
@@ -540,7 +586,7 @@ export async function verifySettlementTransaction(
       }));
       // Sum of document allocations must equal the publisher's verified payment.
       const allocationSum = documentAllocations.reduce(
-        (acc: bigint, d) => acc + BigInt(d.amount_base_units),
+        (acc: bigint, d: any) => acc + BigInt(d.amount_base_units),
         BigInt(0)
       );
       if (allocationSum !== BigInt(item.received_amount)) {
@@ -569,7 +615,7 @@ export async function verifySettlementTransaction(
           formatUsdc(BigInt(item.received_amount)),
           SETTLEMENT_ASSET,
           cleanSig,
-          new Date(blockTimeSec * 1000).toISOString(),
+          new Date(tx.blockTime! * 1000).toISOString(),
         ]
       );
     }
@@ -588,11 +634,11 @@ export async function verifySettlementTransaction(
     solana_slot: Number(receipt.solana_slot),
     block_time: receipt.block_time,
     memo_verified: receipt.memo_verified,
-    breakdown: verifiedBreakdown.map((b) => ({
+    breakdown: validated.breakdown.map((b: any) => ({
       ...b,
       expected_amount: String(b.expected_amount),
       received_amount: String(b.received_amount),
-      documents: b.documents.map((d) => ({
+      documents: b.documents.map((d: any) => ({
         ...d,
         amount_base_units: String(d.amount_base_units),
       })),

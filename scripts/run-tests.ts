@@ -924,6 +924,10 @@ if (HAS_DB) {
       await createPaymentQuote('zero price query', badChunks);
     } catch (err: any) {
       threw = true;
+      assert(
+        /price|amount/i.test(err.message),
+        `Expected a price-validation error, got: ${err.message}`
+      );
     }
     assert(threw, 'Should throw on zero price');
   });
@@ -950,6 +954,10 @@ if (HAS_DB) {
       await createPaymentQuote('excess price query', badChunks);
     } catch (err: any) {
       threw = true;
+      assert(
+        /price|amount|maximum/i.test(err.message),
+        `Expected a maximum-price error, got: ${err.message}`
+      );
     }
     assert(threw, 'Should throw on excessive price');
   });
@@ -976,6 +984,10 @@ if (HAS_DB) {
       await createPaymentQuote('decimal price query', badChunks);
     } catch (err: any) {
       threw = true;
+      assert(
+        /decimal/i.test(err.message),
+        `Expected a decimal-places error, got: ${err.message}`
+      );
     }
     assert(threw, 'Should throw on too many decimal places');
   });
