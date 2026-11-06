@@ -194,6 +194,16 @@ export async function createPaymentQuote(
 
     let ordinal = 0;
     for (const chunk of matchedChunks) {
+      // Recalculate SHA-256 from actual content and reject if it doesn't match
+      // the stored content_hash. This prevents a publisher from smuggling
+      // modified content by providing a false hash.
+      const recalculatedHash = computeSha256(chunk.content);
+      if (recalculatedHash !== chunk.content_hash) {
+        throw new Error(
+          `Source integrity check failed for chunk ${chunk.id}: content hash mismatch. Stored hash ${chunk.content_hash} does not match recomputed hash ${recalculatedHash}.`
+        );
+      }
+
       await client.query(sourceInsertSql, [
         `src_${crypto.randomUUID()}`,
         quoteId,
@@ -204,7 +214,7 @@ export async function createPaymentQuote(
         chunk.publisher_wallet,
         chunk.document_title,
         chunk.content,
-        chunk.content_hash,
+        recalculatedHash,
         BigInt(parseNumericPrice(chunk.price_per_query_usdc)),
       ]);
     }

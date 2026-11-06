@@ -128,6 +128,33 @@ export async function POST(req: Request) {
           { status: 409 }
         );
       }
+
+      // Verify snapshot chunk IDs match the quote exactly, in order.
+      const snapshotChunkIds = snapshots.map((s) => s.chunk_id);
+      for (let i = 0; i < snapshotChunkIds.length; i++) {
+        if (snapshotChunkIds[i] !== quote.matched_chunk_ids[i]) {
+          return NextResponse.json(
+            {
+              success: false,
+              error: `Snapshot chunk order mismatch at position ${i}: expected ${quote.matched_chunk_ids[i]}, got ${snapshotChunkIds[i]}. No settlement was recorded.`,
+            },
+            { status: 409 }
+          );
+        }
+      }
+
+      // Reject duplicate snapshot chunk IDs.
+      const uniqueSnapshotChunkIds = new Set(snapshotChunkIds);
+      if (uniqueSnapshotChunkIds.size !== snapshotChunkIds.length) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: 'Duplicate snapshot chunk IDs detected. No settlement was recorded.',
+          },
+          { status: 409 }
+        );
+      }
+
       const snapshotIntegrity = snapshots.map((s) => ({
         content: s.source_content,
         content_hash: s.source_sha256,
@@ -192,6 +219,32 @@ export async function POST(req: Request) {
           success: false,
           error:
             'Snapshot chunk count does not match the quoted sources. No settlement was recorded.',
+        },
+        { status: 409 }
+      );
+    }
+
+    // Verify snapshot chunk IDs match the quote exactly, in order.
+    const snapshotChunkIds = snapshots.map((s) => s.chunk_id);
+    for (let i = 0; i < snapshotChunkIds.length; i++) {
+      if (snapshotChunkIds[i] !== quote.matched_chunk_ids[i]) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `Snapshot chunk order mismatch at position ${i}: expected ${quote.matched_chunk_ids[i]}, got ${snapshotChunkIds[i]}. No settlement was recorded.`,
+          },
+          { status: 409 }
+        );
+      }
+    }
+
+    // Reject duplicate snapshot chunk IDs.
+    const uniqueSnapshotChunkIds = new Set(snapshotChunkIds);
+    if (uniqueSnapshotChunkIds.size !== snapshotChunkIds.length) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'Duplicate snapshot chunk IDs detected. No settlement was recorded.',
         },
         { status: 409 }
       );

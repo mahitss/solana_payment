@@ -352,21 +352,13 @@ export function validateParsedSettlementTransaction(
 
   const splTransfers = extractSplTransfers(tx);
 
-  // Validate every SPL transfer
+  // Aggregate instruction amounts per destination ATA
+  const instructionAmountsByDest = new Map<string, bigint>();
+
+  // Validate every SPL transfer instruction
   for (const transfer of splTransfers) {
     const destIsPriced = expectedDestinations.has(transfer.destination);
-
-    // Reject third-party funding to a priced publisher's ATA
-    if (destIsPriced && transfer.source !== payerAtaStr) {
-      throw new SolanaVerificationError(
-        `Third-party funding detected: transfer to ${transfer.destination} from non-buyer source ${transfer.source}.`,
-        'THIRD_PARTY_FUNDING'
-      );
-    }
-
-    // Skip transfers that don't involve our pricing
-    if (transfer.source !== payerAtaStr) continue;
-    if (!destIsPriced) continue;
+    const isFromBuyer = transfer.source === payerAtaStr;
 
     // Verify source account mint is USDC via token-balance metadata
     const sourceMint = getTokenAccountMint(tx, transfer.source);
@@ -385,38 +377,50 @@ export function validateParsedSettlementTransaction(
         'WRONG_DESTINATION_MINT'
       );
     }
+
+    // Reject third-party funding to a priced publisher's ATA
+    if (destIsPriced && !isFromBuyer) {
+      throw new SolanaVerificationError(
+        `Third-party funding detected: transfer to ${transfer.destination} from non-buyer source ${transfer.source}.`,
+        'THIRD_PARTY_FUNDING'
+      );
+    }
+
+    // Reject unexpected outgoing transfer from buyer ATA to non-priced destination
+    if (isFromBuyer && !destIsPriced) {
+      throw new SolanaVerificationError(
+        `Unexpected outgoing transfer from buyer ATA to ${transfer.destination}.`,
+        'UNEXPECTED_OUTFLOW'
+      );
+    }
+
+    // Reject unexpected incoming transfer to buyer ATA from non-buyer source
+    if (transfer.destination === payerAtaStr && !isFromBuyer) {
+      throw new SolanaVerificationError(
+        `Unexpected incoming transfer to buyer ATA from ${transfer.source}.`,
+        'UNEXPECTED_INFLOW'
+      );
+    }
+
+    // Aggregate instruction amounts for buyer→priced-publisher transfers
+    if (isFromBuyer && destIsPriced) {
+      const existing = instructionAmountsByDest.get(transfer.destination) ?? BigInt(0);
+      instructionAmountsByDest.set(transfer.destination, existing + transfer.amount);
+    }
   }
 
-  // Compute actual credited amounts from token balance deltas
+  // Compute balance deltas ONCE per account (ground truth, not per instruction)
+  const payerAtaDelta = getTokenAccountDelta(tx, payerAtaStr);
+
   const destinationDeltas = new Map<string, bigint>();
-  for (const transfer of splTransfers) {
-    if (transfer.source !== payerAtaStr) continue;
-    if (!expectedDestinations.has(transfer.destination)) continue;
-
-    const delta = getTokenAccountDelta(tx, transfer.destination);
-    if (delta > BigInt(0)) {
-      const existing = destinationDeltas.get(transfer.destination) ?? BigInt(0);
-      destinationDeltas.set(transfer.destination, existing + delta);
-    }
-  }
-
-  // Also check for unexpected incoming transfers to buyer ATA
-  const buyerIncomingDeltas = new Map<string, bigint>();
-  for (const transfer of splTransfers) {
-    if (transfer.destination !== payerAtaStr) continue;
-    if (transfer.source === payerAtaStr) continue;
-    const delta = getTokenAccountDelta(tx, transfer.destination);
-    if (delta > BigInt(0)) {
-      const existing = buyerIncomingDeltas.get(transfer.source) ?? BigInt(0);
-      buyerIncomingDeltas.set(transfer.source, existing + delta);
-    }
-  }
-  if (buyerIncomingDeltas.size > 0) {
-    const sources = Array.from(buyerIncomingDeltas.keys()).join(', ');
-    throw new SolanaVerificationError(
-      `Unexpected incoming transfers to buyer ATA from: ${sources}`,
-      'UNEXPECTED_INFLOW'
+  for (const pub of quote.publisher_breakdown) {
+    const expectedAta = getAssociatedTokenAddressSync(
+      DEVNET_USDC_MINT,
+      new PublicKey(pub.publisher_wallet)
     );
+    const expectedAtaStr = expectedAta.toBase58();
+    const delta = getTokenAccountDelta(tx, expectedAtaStr);
+    destinationDeltas.set(expectedAtaStr, delta);
   }
 
   let totalTransferredBaseUnits = BigInt(0);
@@ -429,19 +433,28 @@ export function validateParsedSettlementTransaction(
     );
     const expectedAtaStr = expectedAta.toBase58();
 
-    const amountReceivedForPub = destinationDeltas.get(expectedAtaStr) ?? BigInt(0);
+    const instructionTotal = instructionAmountsByDest.get(expectedAtaStr) ?? BigInt(0);
+    const balanceDelta = destinationDeltas.get(expectedAtaStr) ?? BigInt(0);
+
+    // Instruction total must match balance delta (no double counting)
+    if (instructionTotal !== balanceDelta) {
+      throw new SolanaVerificationError(
+        `Instruction total ${instructionTotal} for publisher ${pub.publisher_name} does not match balance delta ${balanceDelta}.`,
+        'TRANSFER_AMOUNT_MISMATCH'
+      );
+    }
 
     const expectedAmount = BigInt(pub.amount_base_units);
-    if (amountReceivedForPub !== expectedAmount) {
+    if (balanceDelta !== expectedAmount) {
       throw new SolanaVerificationError(
-        `Incorrect ${SETTLEMENT_ASSET} amount for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected exactly ${expectedAmount} base units, received ${amountReceivedForPub} base units.`,
-        amountReceivedForPub < expectedAmount
+        `Incorrect ${SETTLEMENT_ASSET} amount for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected exactly ${expectedAmount} base units, received ${balanceDelta} base units.`,
+        balanceDelta < expectedAmount
           ? 'INSUFFICIENT_TRANSFER'
           : 'EXCESSIVE_TRANSFER'
       );
     }
 
-    totalTransferredBaseUnits += amountReceivedForPub;
+    totalTransferredBaseUnits += balanceDelta;
     verifiedBreakdown.push({
       publisher_id: pub.publisher_id,
       publisher_wallet: pub.publisher_wallet,
@@ -450,7 +463,7 @@ export function validateParsedSettlementTransaction(
       document_titles: pub.documents.map((d) => d.document_title),
       documents: pub.documents,
       expected_amount: expectedAmount,
-      received_amount: amountReceivedForPub,
+      received_amount: balanceDelta,
       verified: true,
     });
   }
@@ -466,7 +479,6 @@ export function validateParsedSettlementTransaction(
   }
 
   // Exact payer debit
-  const payerAtaDelta = getTokenAccountDelta(tx, payerAtaStr);
   const expectedPayerDebit = -BigInt(quote.total_base_units);
   if (payerAtaDelta !== expectedPayerDebit) {
     throw new SolanaVerificationError(
@@ -557,7 +569,17 @@ export async function verifySettlementTransaction(
       validated.totalBaseUnits,
       tx.slot,
       new Date(tx.blockTime! * 1000).toISOString(),
-      JSON.stringify(validated.breakdown),
+      JSON.stringify(
+        validated.breakdown.map((b: any) => ({
+          ...b,
+          expected_amount: String(b.expected_amount),
+          received_amount: String(b.received_amount),
+          documents: b.documents.map((d: any) => ({
+            ...d,
+            amount_base_units: String(d.amount_base_units),
+          })),
+        }))
+      ),
     ]);
 
     // Mark the quote redeemed. The conditional UPDATE means two concurrent
