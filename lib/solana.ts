@@ -417,6 +417,13 @@ export async function verifySettlementTransaction(
     publisher_name: string;
     document_ids: string[];
     document_titles: string[];
+    documents: Array<{
+      document_id: string;
+      document_title: string;
+      chunk_ids: string[];
+      amount_base_units: bigint;
+      amount_usdc: string;
+    }>;
     expected_amount: string;
     received_amount: string;
     verified: boolean;
@@ -452,6 +459,7 @@ export async function verifySettlementTransaction(
       publisher_name: pub.publisher_name,
       document_ids: allDocumentIds,
       document_titles: allDocumentTitles,
+      documents: pub.documents,
       expected_amount: String(expectedAmount),
       received_amount: String(amountReceivedForPub),
       verified: true,
@@ -523,11 +531,30 @@ export async function verifySettlementTransaction(
     // Normalised payout ledger: one row per publisher per receipt, indexed so
     // per-publisher royalty accounting is a query rather than a table scan.
     for (const item of verifiedBreakdown) {
+      const documentAllocations = item.documents.map((d) => ({
+        document_id: d.document_id,
+        document_title: d.document_title,
+        amount_base_units: String(d.amount_base_units),
+        amount_usdc: d.amount_usdc,
+        chunk_ids: d.chunk_ids,
+      }));
+      // Sum of document allocations must equal the publisher's verified payment.
+      const allocationSum = documentAllocations.reduce(
+        (acc: bigint, d) => acc + BigInt(d.amount_base_units),
+        BigInt(0)
+      );
+      if (allocationSum !== BigInt(item.received_amount)) {
+        throw new SolanaVerificationError(
+          `Document allocation sum ${allocationSum} does not match verified payment ${item.received_amount} for publisher ${item.publisher_wallet}`,
+          'ALLOCATION_SUM_MISMATCH'
+        );
+      }
+
       await client.query(
         `INSERT INTO settlement_payouts (
            id, receipt_id, quote_id, publisher_id, publisher_wallet, publisher_name,
-           document_ids, amount_base_units, amount_usdc, asset, tx_signature, block_time
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           document_ids, document_allocations, amount_base_units, amount_usdc, asset, tx_signature, block_time
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (receipt_id, publisher_wallet) DO NOTHING`,
         [
           `pay_${crypto.randomUUID()}`,
@@ -537,6 +564,7 @@ export async function verifySettlementTransaction(
           item.publisher_wallet,
           item.publisher_name,
           item.document_ids,
+          JSON.stringify(documentAllocations),
           item.received_amount,
           formatUsdc(BigInt(item.received_amount)),
           SETTLEMENT_ASSET,
@@ -564,6 +592,10 @@ export async function verifySettlementTransaction(
       ...b,
       expected_amount: String(b.expected_amount),
       received_amount: String(b.received_amount),
+      documents: b.documents.map((d) => ({
+        ...d,
+        amount_base_units: String(d.amount_base_units),
+      })),
     })),
     created_at: receipt.created_at,
   };
