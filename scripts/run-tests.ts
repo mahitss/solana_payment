@@ -508,11 +508,6 @@ await test('validateParsedSettlementTransaction: valid exact payment to one publ
     err: null,
   });
 
-  console.log('DEBUG buyerWallet:', buyerWallet);
-  console.log('DEBUG buyerAta:', buyerAta);
-  console.log('DEBUG pubWallet:', pubWallet);
-  console.log('DEBUG pubAta:', pubAta);
-  console.log('DEBUG tx.accountKeys:', tx.transaction.message.accountKeys.map(k => k.pubkey.toBase58()));
 
   const result = validateParsedSettlementTransaction(tx, quote, buyerWallet);
   assert.strictEqual(result.valid, true);
