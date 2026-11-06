@@ -12,10 +12,10 @@ export const dynamic = 'force-dynamic';
  */
 export async function GET(
   req: Request,
-  { params }: { params: { sig: string } }
+  { params }: { params: Promise<{ sig: string }> }
 ) {
   try {
-    const sig = params.sig;
+    const { sig } = await params;
     if (!sig) {
       return NextResponse.json(
         { success: false, error: 'Signature is required.' },

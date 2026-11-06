@@ -5,7 +5,10 @@ import { getActiveAIProvider } from '@/lib/ai/provider';
 import { query } from '@/lib/db';
 import { ChunkRecord } from '@/lib/documents';
 import { SETTLEMENT_ASSET } from '@/lib/protocol';
+import { computeSha256 } from '@/lib/chunker';
+import { computeSourceDigest } from '@/lib/protocol';
 import crypto from 'crypto';
+import { requireAuth, AuthError } from '@/lib/auth';
 
 export const dynamic = 'force-dynamic';
 
@@ -20,15 +23,25 @@ interface ExecutionRow {
 /**
  * Settles a quote.
  *
- * Order of operations is deliberate: the on-chain payment is verified and
- * recorded FIRST, and only then is the answer generated. If generation fails
- * the payment is still settled and recorded, and the endpoint stays
- * idempotent so the consumer can retry generation without paying twice.
+ * Requires an authenticated buyer session. The buyer wallet is derived from
+ * the session token and bound to the quote at creation time. Settlement
+ * verifies that the transaction fee payer matches the authenticated buyer,
+ * then verifies on-chain payment, then releases the paid answer.
+ *
+ * Order of operations: payment verified and recorded FIRST, then answer
+ * generated. Idempotent — re-posting a redeemed quote returns the existing
+ * receipt and (if needed) produces the answer without charging twice.
  */
 export async function POST(req: Request) {
   try {
-    const { quoteId, txSignature, buyerWallet } = await req.json().catch(() => ({}));
+    // TASK 2: Settlement requires a valid authenticated session.
+    const session = requireAuth(req);
+    const buyerWallet = session.wallet;
 
+    const { quoteId, txSignature } = await req.json().catch(() => ({}));
+
+    // Never trust buyerWallet from the request body. The expected payer is
+    // derived from the persisted quote data (Task 2, item 4 & 6).
     if (!quoteId || typeof quoteId !== 'string') {
       return NextResponse.json(
         { success: false, error: 'quoteId is required.' },
@@ -52,9 +65,17 @@ export async function POST(req: Request) {
       );
     }
 
-    // 2. Idempotent path: the quote was already settled. Return the existing
-    //    receipt, regenerating the answer if it was never produced.
+    // TASK 2, item 8 & 9: Already-redeemed quotes return answers only to
+    // their authenticated buyer.
     if (quote.status === 'REDEEMED') {
+      // TASK 2, item 9: Only the authenticated buyer can retrieve the answer.
+      if (quote.buyer_wallet !== buyerWallet) {
+        return NextResponse.json(
+          { success: false, error: 'This quote was purchased by a different wallet.' },
+          { status: 403 }
+        );
+      }
+
       const existing = await query(
         `SELECT r.*, e.id AS exec_id, e.ai_provider, e.ai_model, e.generated_answer, e.citations
          FROM settlement_receipts r
@@ -73,6 +94,15 @@ export async function POST(req: Request) {
       }
 
       const row = existing.rows[0];
+
+      // TASK 2, item 10: Verify the original transaction signature matches
+      // the recorded settlement.
+      if (row.tx_signature !== txSignature) {
+        return NextResponse.json(
+          { success: false, error: 'Transaction signature does not match the recorded settlement.' },
+          { status: 400 }
+        );
+      }
 
       if (row.generated_answer) {
         return NextResponse.json({
@@ -107,10 +137,14 @@ export async function POST(req: Request) {
     }
 
     // 3. Perform Server-Side On-Chain Settlement Verification.
-    //    CRITICAL: Paid content is NEVER released before on-chain confirmation.
+    //    The expected payer is derived from the quote's buyer_wallet, not
+    //    from the request body (Task 2, item 6 & 7).
     const receipt = await verifySettlementTransaction(txSignature, quote, buyerWallet);
 
-    // 4. Retrieve the Exact Matched Chunks
+    // TASK 4: Source Integrity — fetch exactly the chunk IDs stored in the
+    // quote, preserve order, recalculate SHA-256 hashes, recompute the
+    // combined source digest, and verify it against the digest committed
+    // in the quote memo. Reject missing or modified chunks.
     const chunksRes = await query<ChunkRecord>(
       `SELECT
          c.id, c.document_id, c.publisher_id, c.chunk_index, c.content, c.content_hash, c.token_count,
@@ -126,12 +160,40 @@ export async function POST(req: Request) {
 
     const chunks = chunksRes.rows;
 
-    if (chunks.length === 0) {
+    if (chunks.length !== quote.matched_chunk_ids.length) {
+      // Reject missing chunks — no partial fulfillment.
       return NextResponse.json(
         {
           success: false,
           error:
-            'The paid knowledge sources are no longer available. The receipt has been recorded; please contact support.',
+            'Some purchased knowledge sources are no longer available. The receipt has been recorded; please contact support.',
+        },
+        { status: 409 }
+      );
+    }
+
+    // Recalculate each SHA-256 content hash and verify against stored hash.
+    for (const chunk of chunks) {
+      const recalculatedHash = computeSha256(chunk.content);
+      if (recalculatedHash !== chunk.content_hash) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `Source integrity check failed for chunk ${chunk.id}: content has been modified.`,
+          },
+          { status: 409 }
+        );
+      }
+    }
+
+    // Recalculate the combined source digest and verify against the memo.
+    const recalculatedDigest = computeSourceDigest(chunks.map((c) => c.content_hash));
+    const memoDigest = quote.memo_expected.split(':').pop() || '';
+    if (recalculatedDigest !== memoDigest) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'Source digest mismatch: purchased content does not match the quoted sources.',
         },
         { status: 409 }
       );
@@ -165,6 +227,12 @@ export async function POST(req: Request) {
       receipt: serialiseReceipt(receipt),
     });
   } catch (err: any) {
+    if (err instanceof AuthError) {
+      return NextResponse.json(
+        { success: false, error: err.message, code: err.code },
+        { status: err.status }
+      );
+    }
     console.error('Settlement verification error:', err);
     if (err instanceof SolanaVerificationError) {
       return NextResponse.json(

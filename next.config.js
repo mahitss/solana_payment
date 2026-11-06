@@ -4,9 +4,8 @@ const nextConfig = {
   poweredByHeader: false,
   // pdf-parse pulls in a large CommonJS dependency chain; keep it out of the
   // server bundle so it is required natively at runtime.
-  experimental: {
-    serverComponentsExternalPackages: ['pdf-parse'],
-  },
+  // (Next 16 renamed this from `experimental.serverComponentsExternalPackages`.)
+  serverExternalPackages: ['pdf-parse'],
   async headers() {
     return [
       {

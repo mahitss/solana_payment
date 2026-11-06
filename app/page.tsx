@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { WalletProvider, useWallet } from '@/components/WalletContext';
 import {
   Search,
@@ -69,8 +69,8 @@ function CiteRailDashboard() {
   const [activeTab, setActiveTab] = useState<'consumer' | 'publisher' | 'verifier'>('consumer');
 
   // Wallet-based session. The token is what proves to the server that this
-  // browser controls the connected wallet; publishing and reading private
-  // publisher economics both require it.
+  // browser controls the connected wallet; publishing, quoting, and settling
+  // all require it.
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [authWallet, setAuthWallet] = useState<string | null>(null);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
@@ -93,7 +93,6 @@ function CiteRailDashboard() {
   } | null>(null);
 
   // Publisher State
-  const [publisherWalletInput, setPublisherWalletInput] = useState('');
   const [publisherNameInput, setPublisherNameInput] = useState('');
   const [docTitle, setDocTitle] = useState('');
   const [docContent, setDocContent] = useState('');
@@ -103,8 +102,16 @@ function CiteRailDashboard() {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
-  const [publisherData, setPublisherData] = useState<any>(null);
+  const [publisherDataByWallet, setPublisherDataByWallet] = useState<
+    Record<string, any>
+  >({});
   const [isLoadingPublisher, setIsLoadingPublisher] = useState(false);
+
+  // Publisher economics are keyed by wallet so switching accounts can never
+  // show one publisher's revenue to another.
+  const publisherData = publicKey
+    ? publisherDataByWallet[publicKey] ?? null
+    : null;
 
   // Public Verifier State
   const [verifySigInput, setVerifySigInput] = useState('');
@@ -112,20 +119,38 @@ function CiteRailDashboard() {
   const [verifiedReceipt, setVerifiedReceipt] = useState<any>(null);
   const [verifyError, setVerifyError] = useState<string | null>(null);
 
-  // Auto-sync wallet input when user connects wallet
-  useEffect(() => {
-    if (publicKey) {
-      setPublisherWalletInput(publicKey);
-      setAuthToken(null);
-      setAuthWallet(null);
-      setAuthError(null);
-      fetchPublisherEconomics(publicKey);
-    } else {
-      setAuthToken(null);
-      setAuthWallet(null);
-      setPublisherData(null);
-    }
-  }, [publicKey]);
+  /**
+   * A session is only valid for the wallet it was issued to. Deriving this
+   * instead of clearing it inside an effect means switching wallets
+   * invalidates the session immediately and cannot leave stale state behind.
+   */
+  const sessionToken =
+    authToken && authWallet && authWallet === publicKey ? authToken : null;
+
+  const fetchPublisherEconomics = useCallback(
+    async (wallet: string, token?: string | null) => {
+      // Economics are private to the wallet owner, so they are only fetched
+      // once a session token exists.
+      if (!token) return;
+
+      setIsLoadingPublisher(true);
+      try {
+        const res = await fetch('/api/publisher/economics', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const data = await res.json();
+        setPublisherDataByWallet((prev) => ({
+          ...prev,
+          [wallet]: data.success && data.registered ? data.publisher : null,
+        }));
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setIsLoadingPublisher(false);
+      }
+    },
+    []
+  );
 
   /**
    * Proves ownership of the connected wallet by signing a server-issued
@@ -169,7 +194,7 @@ function CiteRailDashboard() {
 
       setAuthToken(verifyData.token);
       setAuthWallet(verifyData.wallet);
-      fetchPublisherEconomics(verifyData.wallet, verifyData.token);
+      await fetchPublisherEconomics(verifyData.wallet, verifyData.token);
     } catch (err: any) {
       setAuthError(err.message);
     } finally {
@@ -177,31 +202,11 @@ function CiteRailDashboard() {
     }
   };
 
-  const fetchPublisherEconomics = async (wallet: string, token?: string | null) => {
-    // Economics are private to the wallet owner, so they are only fetched once
-    // a session token exists.
-    if (!token) {
-      setPublisherData(null);
-      return;
-    }
-
-    setIsLoadingPublisher(true);
-    try {
-      const res = await fetch('/api/publisher/economics', {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await res.json();
-      if (data.success && data.registered) {
-        setPublisherData(data.publisher);
-      } else if (data.success) {
-        setPublisherData(null);
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsLoadingPublisher(false);
-    }
-  };
+  // Load economics whenever a valid session becomes available.
+  useEffect(() => {
+    if (!sessionToken || !publicKey) return;
+    void fetchPublisherEconomics(publicKey, sessionToken);
+  }, [sessionToken, publicKey, fetchPublisherEconomics]);
 
   // 1. Consumer: Request Quote
   const handleRequestQuote = async (e?: React.FormEvent) => {
@@ -218,7 +223,10 @@ function CiteRailDashboard() {
     try {
       const res = await fetch('/api/quotes', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+        },
         body: JSON.stringify({
           query: queryInput.trim(),
           buyerWallet: publicKey || undefined,
@@ -247,12 +255,27 @@ function CiteRailDashboard() {
   // 2. Consumer: Settle on Solana & Unlock Answer
   const handlePayAndSettle = async () => {
     if (!quote) return;
-    if (!publicKey) {
+
+    // Buyer must authenticate before settling.
+    if (!authToken) {
+      if (!publicKey) {
+        setSettlementError('Connect your wallet to settle.');
+        return;
+      }
       try {
-        await connectWallet();
+        await authenticate();
       } catch {
         return;
       }
+      if (!authToken) {
+        setSettlementError('Wallet authentication is required to settle.');
+        return;
+      }
+    }
+
+    if (!publicKey) {
+      setSettlementError('Wallet is not connected.');
+      return;
     }
 
     setIsSettling(true);
@@ -265,14 +288,17 @@ function CiteRailDashboard() {
         memoExpected: quote.memoExpected,
       });
 
-      // 2. Send transaction signature to server-side settlement gatekeeper
+      // 2. Send transaction signature to server-side settlement gatekeeper.
+      //    The buyer wallet is derived from the session, never from the body.
       const settleRes = await fetch('/api/settle', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
         body: JSON.stringify({
           quoteId: quote.id,
           txSignature,
-          buyerWallet: publicKey,
         }),
       });
 

@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { PublicKey } from '@solana/web3.js';
 import { query } from './db';
-import { config } from './config';
+import { config, getAuthSecret } from './config';
 
 /**
  * Wallet-based authentication ("Sign-In With Solana" style).
@@ -100,7 +100,7 @@ export function verifyWalletSignature(
   }
   if (sigBytes.length !== 64) return false;
 
-  let publicKeyBytes: Buffer;
+  let publicKeyBytes: Uint8Array;
   try {
     publicKeyBytes = new PublicKey(wallet.trim()).toBytes();
   } catch {
@@ -236,16 +236,6 @@ export function requireAuth(req: Request): AuthenticatedSession {
     throw new AuthError('Invalid or expired session token.', 'INVALID_TOKEN');
   }
   return session;
-}
-
-/**
- * Resolves the auth secret lazily so that importing this module never throws
- * during `next build`.
- */
-function getAuthSecret(): string {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { getAuthSecret: resolve } = require('./config');
-  return resolve();
 }
 
 /**

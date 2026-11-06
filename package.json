@@ -1,38 +1,44 @@
 {
   "name": "citerail",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Licensed knowledge retrieval and creator royalty settlement platform on Solana",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "node --loader ts-node/esm scripts/run-tests.ts",
-    "db:migrate": "node --loader ts-node/esm scripts/migrate.ts"
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx scripts/run-tests.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:seed": "tsx scripts/seed.ts",
+    "verify:devnet": "tsx scripts/verify-devnet.ts"
   },
   "dependencies": {
-    "@solana/spl-token": "^0.4.12",
+    "@solana/spl-token": "^0.4.15",
     "@solana/web3.js": "^1.98.0",
     "clsx": "^2.1.1",
     "dotenv": "^16.4.7",
     "lucide-react": "^0.468.0",
-    "next": "^14.2.23",
+    "next": "^16.4.5",
     "pdf-parse": "^1.1.1",
     "pg": "^8.13.1",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
     "tailwind-merge": "^2.6.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/pdf-parse": "^1.1.4",
     "@types/pg": "^8.11.10",
-    "@types/react": "^18.3.18",
-    "@types/react-dom": "^18.3.5",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
     "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.49",
+    "eslint": "^9.39.0",
+    "eslint-config-next": "^16.4.5",
+    "postcss": "^8.5.32",
     "tailwindcss": "^3.4.17",
-    "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
 }

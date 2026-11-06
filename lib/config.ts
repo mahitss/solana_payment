@@ -6,6 +6,8 @@
  * (which would also break `next build` in a clean environment).
  */
 
+import crypto from 'crypto';
+
 function required(name: string): string {
   const value = process.env[name];
   if (!value || !value.trim()) {
@@ -63,7 +65,7 @@ export function getAuthSecret(): string {
     '[config] AUTH_SECRET not set - using an ephemeral development secret. ' +
       'Sessions will be invalidated on restart. Set AUTH_SECRET before deploying.'
   );
-  cachedAuthSecret = require('crypto').randomBytes(32).toString('hex');
+  cachedAuthSecret = crypto.randomBytes(32).toString('hex');
   return cachedAuthSecret;
 }
 

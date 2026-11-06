@@ -34,6 +34,7 @@ export interface PaymentQuote {
   total_price_usdc: number;
   total_base_units: number;
   memo_expected: string;
+  buyer_wallet: string | null;
   expires_at: string;
   status: 'PENDING' | 'REDEEMED' | 'EXPIRED';
   created_at: string;
@@ -42,6 +43,7 @@ export interface PaymentQuote {
 export async function createPaymentQuote(
   queryText: string,
   matchedChunks: ChunkRecord[],
+  buyerWallet: string | null = null,
   expirySeconds: number = config.quoteExpirySeconds
 ): Promise<PaymentQuote> {
   if (matchedChunks.length === 0) {
@@ -61,7 +63,12 @@ export async function createPaymentQuote(
 
     if (!entry) {
       const price = Number.parseFloat(chunk.price_per_query_usdc);
-      const baseUnits = toBaseUnits(Number.isFinite(price) ? price : 0.05);
+      if (!Number.isFinite(price) || price <= 0) {
+        throw new Error(
+          `Invalid or missing price for document ${chunk.document_id} (chunk ${chunk.id}). Quotes fail closed on invalid pricing.`
+        );
+      }
+      const baseUnits = toBaseUnits(price);
 
       entry = {
         publisher_id: chunk.publisher_id,
@@ -103,8 +110,8 @@ export async function createPaymentQuote(
   const insertSql = `
     INSERT INTO payment_quotes (
       id, quote_nonce, query_text, matched_chunk_ids, publisher_breakdown,
-      total_price_usdc, memo_expected, expires_at, status
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING')
+      total_price_usdc, memo_expected, buyer_wallet, expires_at, status
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING')
     RETURNING *;
   `;
 
@@ -116,6 +123,7 @@ export async function createPaymentQuote(
     JSON.stringify(publisherBreakdown),
     formatUsdc(totalBaseUnits),
     memoExpected,
+    buyerWallet,
     expiresAt,
   ]);
 
@@ -130,6 +138,7 @@ export async function createPaymentQuote(
     total_price_usdc: totalPriceUsdc,
     total_base_units: totalBaseUnits,
     memo_expected: row.memo_expected,
+    buyer_wallet: row.buyer_wallet,
     expires_at: row.expires_at,
     status: row.status,
     created_at: row.created_at,
@@ -166,6 +175,7 @@ export async function getQuote(quoteId: string): Promise<PaymentQuote | null> {
     total_price_usdc: fromBaseUnits(totalBaseUnits),
     total_base_units: totalBaseUnits,
     memo_expected: row.memo_expected,
+    buyer_wallet: row.buyer_wallet,
     expires_at: row.expires_at,
     status: row.status,
     created_at: row.created_at,

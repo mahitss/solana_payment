@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import {
   Connection,
   PublicKey,
@@ -9,12 +10,7 @@ import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { withTransaction } from './db';
 import { PaymentQuote } from './quotes';
 import { config } from './config';
-import {
-  SETTLEMENT_ASSET,
-  USDC_BASE_UNIT,
-  formatUsdc,
-  fromBaseUnits,
-} from './protocol';
+import { SETTLEMENT_ASSET, formatUsdc } from './protocol';
 
 export const DEVNET_RPC_URL = config.solanaRpcUrl;
 export const DEVNET_USDC_MINT = new PublicKey(config.usdcMint);
@@ -217,25 +213,27 @@ export async function verifySettlementTransaction(
     );
   }
 
+  // D. Never accept missing transaction metadata as proof of success.
+  if (!tx.meta) {
+    throw new SolanaVerificationError(
+      `Transaction ${cleanSig} has no on-chain metadata.`,
+      'TRANSACTION_NO_META'
+    );
+  }
+
   // 3. Verify on-chain execution status
-  if (tx.meta?.err !== null && tx.meta?.err !== undefined) {
+  if (tx.meta.err !== null) {
     throw new SolanaVerificationError(
       `Transaction failed on-chain with error: ${JSON.stringify(tx.meta.err)}`,
       'TRANSACTION_FAILED'
     );
   }
 
-  // 4. Verify Quote Expiry against Block Time
-  const blockTimeSec = tx.blockTime || Math.floor(Date.now() / 1000);
-  const quoteExpiresTimeSec = Math.floor(new Date(quote.expires_at).getTime() / 1000);
-
-  // Allow a 60 second clock tolerance
-  if (blockTimeSec > quoteExpiresTimeSec + 60) {
+  // D. Never accept a missing block time as proof of timing.
+  if (!tx.blockTime) {
     throw new SolanaVerificationError(
-      `Quote ${quote.id} expired at ${quote.expires_at}, but transaction was mined at ${new Date(
-        blockTimeSec * 1000
-      ).toISOString()}`,
-      'QUOTE_EXPIRED'
+      `Transaction ${cleanSig} has no block time. Cannot verify quote expiry.`,
+      'TRANSACTION_NO_BLOCK_TIME'
     );
   }
 
@@ -251,6 +249,20 @@ export async function verifySettlementTransaction(
     throw new SolanaVerificationError(
       `Transaction payer mismatch. Expected: ${expectedPayer}, got: ${feePayer}`,
       'PAYER_MISMATCH'
+    );
+  }
+
+  // 4. Verify Quote Expiry against Block Time
+  const blockTimeSec = tx.blockTime;
+  const quoteExpiresTimeSec = Math.floor(new Date(quote.expires_at).getTime() / 1000);
+
+  // Allow a 60 second clock tolerance
+  if (blockTimeSec > quoteExpiresTimeSec + 60) {
+    throw new SolanaVerificationError(
+      `Quote ${quote.id} expired at ${quote.expires_at}, but transaction was mined at ${new Date(
+        blockTimeSec * 1000
+      ).toISOString()}`,
+      'QUOTE_EXPIRED'
     );
   }
 
@@ -284,9 +296,9 @@ export async function verifySettlementTransaction(
 
   const splTransfers = extractSplTransfers(tx);
 
-  // Every USDC transfer in this transaction must go to a publisher we priced.
-  // This prevents a buyer from bundling extra USDC outflows into the same
-  // atomic transaction.
+  // Every USDC transfer in this transaction must originate from the buyer's
+  // authorized USDC token account and go to a publisher we priced. This
+  // prevents third-party funding and extra USDC outflows in the same tx.
   const expectedDestinations = new Map<string, string>();
   for (const pub of quote.publisher_breakdown) {
     const pubKey = new PublicKey(pub.publisher_wallet);
@@ -296,15 +308,15 @@ export async function verifySettlementTransaction(
     );
   }
 
+  // Validate every SPL transfer before crediting any publisher.
   for (const transfer of splTransfers) {
-    // Determine whether this transfer is a USDC transfer.
-    const isUsdc =
-      transfer.mint !== undefined
-        ? transfer.mint === usdcMintStr
-        : transfer.source === payerAtaStr;
+    // Reject transfers that do not involve the configured USDC mint.
+    if (transfer.mint !== undefined && transfer.mint !== usdcMintStr) continue;
 
-    if (!isUsdc) continue;
+    // B. Every accepted USDC payment must originate from the buyer's ATA.
+    if (transfer.source !== payerAtaStr) continue;
 
+    // E. Every USDC transfer must go to a priced publisher's ATA.
     if (!expectedDestinations.has(transfer.destination)) {
       throw new SolanaVerificationError(
         `Transaction contains an unexpected USDC transfer to ${transfer.destination}, which is not a publisher in quote ${quote.id}.`,
@@ -313,58 +325,63 @@ export async function verifySettlementTransaction(
     }
   }
 
-  let totalTransferredBaseUnits = 0;
+  let totalTransferredBaseUnits = 0n;
   const verifiedBreakdown: Array<{
     publisher_id: string;
     publisher_wallet: string;
     publisher_name: string;
     document_id: string;
     document_title: string;
-    expected_amount: number;
-    received_amount: number;
+    expected_amount: bigint;
+    received_amount: bigint;
     verified: boolean;
   }> = [];
+
+  // Track which transfers have already been credited to prevent double counting
+  // when the same publisher appears under multiple documents (G) or duplicate
+  // transfer instructions exist in the transaction.
+  const creditedTransferIndices = new Set<number>();
 
   for (const pub of quote.publisher_breakdown) {
     const pubWalletKey = new PublicKey(pub.publisher_wallet);
     const expectedAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, pubWalletKey);
     const expectedAtaStr = expectedAta.toBase58();
 
-    let amountReceivedForPub = 0;
+    let amountReceivedForPub = 0n;
 
-    for (const transfer of splTransfers) {
-      const destIsAta = transfer.destination === expectedAtaStr;
-      const destIsWallet = transfer.destination === pub.publisher_wallet;
+    for (let i = 0; i < splTransfers.length; i++) {
+      const transfer = splTransfers[i];
 
-      if (!destIsAta && !destIsWallet) continue;
+      // Skip transfers already credited (prevents duplicate counting).
+      if (creditedTransferIndices.has(i)) continue;
 
-      // A transfer into the publisher's USDC ATA is necessarily USDC.
-      // A transfer into the bare wallet could be any SPL token, so the mint
-      // must be proven. For an unchecked `transfer` the mint is implied by the
-      // source ATA, which must therefore be the payer's USDC ATA.
-      if (destIsAta) {
-        if (transfer.mint !== undefined && transfer.mint !== usdcMintStr) continue;
-        amountReceivedForPub += transfer.amount;
-        continue;
-      }
+      // Must go to this publisher's ATA.
+      if (transfer.destination !== expectedAtaStr) continue;
 
-      if (transfer.mint === usdcMintStr) {
-        amountReceivedForPub += transfer.amount;
-      } else if (transfer.mint === undefined && transfer.source === payerAtaStr) {
-        amountReceivedForPub += transfer.amount;
-      }
+      // Mint must be USDC (proven via transferChecked or source ATA inference).
+      if (transfer.mint !== undefined && transfer.mint !== usdcMintStr) continue;
+
+      // Source must be the buyer's ATA (third-party funding rejected).
+      if (transfer.source !== payerAtaStr) continue;
+
+      const amount = BigInt(transfer.amount);
+      if (amount <= 0n) continue;
+
+      amountReceivedForPub += amount;
+      creditedTransferIndices.add(i);
     }
 
     // Cross-check against the mint-filtered balance delta. This path is
-    // immune to mint confusion entirely.
+    // immune to mint confusion entirely and uses BigInt.
     const balanceDelta = usdcBalanceDelta(tx, pub.publisher_wallet);
-    if (balanceDelta > amountReceivedForPub) {
-      amountReceivedForPub = balanceDelta;
+    if (balanceDelta > Number(amountReceivedForPub)) {
+      amountReceivedForPub = BigInt(balanceDelta);
     }
 
-    if (amountReceivedForPub < pub.amount_base_units) {
+    const expectedAmount = BigInt(pub.amount_base_units);
+    if (amountReceivedForPub < expectedAmount) {
       throw new SolanaVerificationError(
-        `Insufficient ${SETTLEMENT_ASSET} received for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected ${pub.amount_base_units} base units, received ${amountReceivedForPub} base units.`,
+        `Insufficient ${SETTLEMENT_ASSET} received for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected ${expectedAmount} base units, received ${amountReceivedForPub} base units.`,
         'INSUFFICIENT_TRANSFER'
       );
     }
@@ -376,7 +393,7 @@ export async function verifySettlementTransaction(
       publisher_name: pub.publisher_name,
       document_id: pub.document_id,
       document_title: pub.document_title,
-      expected_amount: pub.amount_base_units,
+      expected_amount: expectedAmount,
       received_amount: amountReceivedForPub,
       verified: true,
     });
@@ -391,8 +408,8 @@ export async function verifySettlementTransaction(
     );
   }
 
-  // 9. Verify the total paid covers the quote total.
-  if (totalTransferredBaseUnits < quote.total_base_units) {
+  // 9. Verify the total paid covers the quote total (BigInt comparison).
+  if (totalTransferredBaseUnits < BigInt(quote.total_base_units)) {
     throw new SolanaVerificationError(
       `Total settled amount ${totalTransferredBaseUnits} base units is below the quoted total ${quote.total_base_units} base units.`,
       'INSUFFICIENT_TOTAL'
@@ -450,14 +467,14 @@ export async function verifySettlementTransaction(
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (receipt_id, publisher_wallet) DO NOTHING`,
         [
-          `pay_${cryptoRandomId()}`,
+          `pay_${crypto.randomUUID()}`,
           receiptId,
           quote.id,
           item.publisher_id,
           item.publisher_wallet,
           item.publisher_name,
           item.received_amount,
-          formatUsdc(item.received_amount),
+          formatUsdc(Number(item.received_amount)),
           SETTLEMENT_ASSET,
           cleanSig,
           new Date(blockTimeSec * 1000).toISOString(),
@@ -479,15 +496,13 @@ export async function verifySettlementTransaction(
     solana_slot: Number(receipt.solana_slot),
     block_time: receipt.block_time,
     memo_verified: receipt.memo_verified,
-    breakdown: verifiedBreakdown,
+    breakdown: verifiedBreakdown.map((b) => ({
+      ...b,
+      expected_amount: Number(b.expected_amount),
+      received_amount: Number(b.received_amount),
+    })),
     created_at: receipt.created_at,
   };
 }
 
-function cryptoRandomId(): string {
-  // Imported lazily to keep the module's import surface small.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('crypto').randomUUID();
-}
-
-export { USDC_BASE_UNIT, fromBaseUnits };
+export { SETTLEMENT_ASSET };

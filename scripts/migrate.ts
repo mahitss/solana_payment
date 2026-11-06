@@ -114,10 +114,20 @@ async function migrate() {
         publisher_breakdown JSONB NOT NULL,
         total_price_usdc NUMERIC(10, 6) NOT NULL,
         memo_expected VARCHAR(255) NOT NULL,
+        buyer_wallet VARCHAR(44),
         expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
         status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+
+    // Backfill buyer_wallet for quotes created before this column existed.
+    await client.query(`
+      ALTER TABLE payment_quotes
+        ADD COLUMN IF NOT EXISTS buyer_wallet VARCHAR(44);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_quotes_buyer ON payment_quotes(buyer_wallet);
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_quotes_nonce ON payment_quotes(quote_nonce);
@@ -223,37 +233,44 @@ async function migrate() {
 
     // Backfill payouts for receipts that were settled before this table
     // existed, so historical revenue is not lost.
-    const backfill = await client.query(`
-      INSERT INTO settlement_payouts (
-        id, receipt_id, quote_id, publisher_id, publisher_wallet, publisher_name,
-        amount_base_units, amount_usdc, asset, tx_signature, block_time
-      )
-      SELECT
-        'pay_' || substr(md5(r.id || b.item->>'publisher_wallet'), 1, 32),
-        r.id,
-        r.quote_id,
-        p.id,
-        b.item->>'publisher_wallet',
-        b.item->>'publisher_name',
-        COALESCE((b.item->>'received_amount')::bigint, 0),
-        COALESCE(((b.item->>'received_amount')::numeric / 1000000), 0),
-        COALESCE(r.settlement_asset, 'USDC'),
-        r.tx_signature,
-        r.block_time
-      FROM settlement_receipts r
-      CROSS JOIN LATERAL jsonb_array_elements(r.breakdown) AS b(item)
-      LEFT JOIN publishers p ON p.wallet_address = b.item->>'publisher_wallet'
-      WHERE NOT EXISTS (
-        SELECT 1 FROM settlement_payouts sp
-        WHERE sp.receipt_id = r.id
-          AND sp.publisher_wallet = b.item->>'publisher_wallet'
-      )
-      ON CONFLICT DO NOTHING;
-    `);
-
-    console.log(
-      `  backfilled ${backfill.rowCount ?? 0} historical settlement payout(s)`
-    );
+    // Non-fatal: historical backfill must not block schema migration.
+    try {
+      const backfill = await client.query(`
+        INSERT INTO settlement_payouts (
+          id, receipt_id, quote_id, publisher_id, publisher_wallet, publisher_name,
+          amount_base_units, amount_usdc, asset, tx_signature, block_time
+        )
+        SELECT
+          'pay_' || substr(md5(r.id || (elem->>'publisher_wallet')), 1, 32),
+          r.id,
+          r.quote_id,
+          p.id,
+          elem->>'publisher_wallet',
+          elem->>'publisher_name',
+          COALESCE((elem->>'received_amount')::bigint, 0),
+          COALESCE(((elem->>'received_amount')::numeric / 1000000), 0),
+          COALESCE(r.settlement_asset, 'USDC'),
+          r.tx_signature,
+          r.block_time
+        FROM settlement_receipts r
+        CROSS JOIN LATERAL jsonb_array_elements(r.breakdown::jsonb) AS elem
+        LEFT JOIN publishers p ON p.wallet_address = elem->>'publisher_wallet'
+        WHERE elem->>'publisher_wallet' IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM settlement_payouts sp
+            WHERE sp.receipt_id = r.id
+              AND sp.publisher_wallet = elem->>'publisher_wallet'
+          )
+        ON CONFLICT DO NOTHING;
+      `);
+      console.log(
+        `  backfilled ${backfill.rowCount ?? 0} historical settlement payout(s)`
+      );
+    } catch (backfillErr) {
+      console.warn(
+        `  backfill skipped: ${backfillErr instanceof Error ? backfillErr.message : String(backfillErr)}`
+      );
+    }
   });
 
   // Verify the schema is actually usable before reporting success.

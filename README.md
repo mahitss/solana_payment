@@ -70,7 +70,7 @@ released, and the resulting receipt is publicly auditable.
     |                            POST /api/settle { quoteId, txSignature }
     |                                      |
     |                                      v
-    |                            on-chain verification (7 checks)
+    |                            on-chain verification (10 checks)
     |                                      |
     |                                      v
     |                            atomic COMMIT: receipt row + quote REDEEMED
@@ -209,15 +209,17 @@ redeemed without a matching receipt (or the other way around).
 
 ### The seven verification checks
 
-Every settlement transaction is put through seven checks before any content is served:
+Every settlement transaction is put through seven core checks before any content is
+served:
 
-1. **Signature format** — the supplied signature must be a plausible, non-empty Solana
-   transaction signature (minimum length enforced before any network call).
+1. **Signature format** — the supplied signature must be a plausible Solana transaction
+   signature (length enforced) before any network call is made.
 2. **Replay protection** — the signature must not already exist in
-   `settlement_receipts`, and the quote must still be `PENDING`. A quote that has been
-   redeemed is rejected with `409`. The same rule protects auth challenges, whose
-   nonce is burned with a conditional `UPDATE` so two concurrent verifications cannot
-   both succeed.
+   `settlement_receipts`, and the quote must still be `PENDING`. The quote redemption
+   itself is a conditional `UPDATE ... WHERE status = 'PENDING'`, so two concurrent
+   redemptions of the same quote cannot both succeed. The same rule protects auth
+   challenges, whose nonce is burned with a conditional `UPDATE` so two concurrent
+   verifications cannot both succeed either.
 3. **On-chain success** — the transaction's `meta.err` must be null, i.e. the chain
    actually executed it rather than aborting it.
 4. **Quote expiry versus block time** — the transaction's block time is compared
@@ -225,17 +227,30 @@ Every settlement transaction is put through seven checks before any content is s
    the quote expired is rejected with `QUOTE_EXPIRED`.
 5. **Payer match** — the transaction's fee payer must be the expected buyer wallet, so
    a third party cannot pay someone else's quote and claim the answer.
-6. **Exact memo binding** — a Memo program instruction must contain the exact expected
-   payload `CITERAIL:QUOTE:<quote_id>:<quote_nonce>:<source_digest>`. The quote id,
-   the per-quote nonce and the SHA-256 digest of the priced chunk hashes together bind
-   the payment to this quote and to precisely the sources that were priced.
+6. **Exact memo binding** — a Memo program instruction must contain exactly the
+   expected payload `CITERAIL:QUOTE:<quote_id>:<quote_nonce>:<source_digest>`. The
+   comparison is exact string equality, not a substring match, so a buyer cannot
+   append extra data to the memo. The quote id, the per-quote nonce and the SHA-256
+   digest of the priced chunk hashes together bind the payment to this quote and to
+   precisely the sources that were priced.
 7. **Per-publisher transfer amount and mint check** — every publisher in the quote's
    breakdown must have received at least their quoted amount, in USDC base units, at
-   their associated token account for the configured mint. Transfers are read from the
-   parsed instructions (SPL token `transfer` / `transferChecked`, with a native SOL
-   fallback), and the pre/post token balance delta is used as a second source of truth
-   when the instruction scan is inconclusive. If any publisher is underpaid the whole
-   settlement fails with `INSUFFICIENT_TRANSFER`.
+   their associated token account for the configured mint. Settlement is exclusively in
+   SPL USDC: native SOL transfers are not accepted, because comparing lamports against
+   USDC base units would let a 50,000-lamport transfer count as a $0.05 payment. The
+   mint is proven either from `transferChecked` or from the source ATA, and the
+   pre/post token balance delta is used as an independent cross-check.
+
+Three further settlement-integrity checks close the remaining gaps:
+
+8. **No unexpected outflows** — every USDC transfer in the transaction must go to a
+   publisher that was actually priced, so a buyer cannot bundle extra USDC outflows
+   into the same atomic transaction.
+9. **The payer was debited** — the buyer's USDC balance must actually have fallen by
+   at least the quoted total.
+10. **The total covers the quote** — the sum of the verified per-publisher amounts must
+    be at least the quoted total, recomputed in integer base units from the breakdown
+    rather than trusted from the stored decimal.
 
 ### Money is handled as integers
 
@@ -243,6 +258,18 @@ All amounts are computed and compared as integer USDC base units (6 decimals), n
 floating-point decimals. A quote's total is recomputed from its per-publisher breakdown
 when it is loaded, so a corrupted or hand-edited row can never cause an under-payment
 to slip through.
+
+### Atomic and idempotent settlement
+
+The receipt, the quote redemption and a normalised `settlement_payouts` royalty ledger
+(one row per publisher per receipt) are written inside a single database transaction.
+If the write fails, everything rolls back — a quote can never end up redeemed without a
+matching receipt, or the other way around.
+
+Settlement is also idempotent. `POST /api/settle` verifies and records the payment
+*first*, then generates the answer. If generation fails the payment is still settled
+and recorded, and re-posting the same quote returns the existing receipt and produces
+the answer without charging the consumer a second time.
 
 ### The AI fails closed
 
@@ -256,11 +283,17 @@ so explicitly when the licensed sources do not contain enough information.
 
 ### Other measures
 
+- Publisher write routes (`POST /api/documents`, `POST /api/publishers`) and the
+  royalty dashboard derive the publisher identity from the **session token**, never
+  from the request body or a query parameter.
 - Session tokens are HMAC-SHA256 signed envelopes compared with `timingSafeEqual`; the
   signing secret must be at least 32 characters and is mandatory in production.
 - Wallet addresses are validated as base58 public keys before they are stored or used.
 - Upload size and query length are bounded by `MAX_UPLOAD_BYTES` and
-  `MAX_QUERY_LENGTH`.
+  `MAX_QUERY_LENGTH`, and queries that match nothing are never quoted or charged.
+- Every settlement receipt is public by design: the payment is provable on-chain, so
+  the receipt, the per-publisher breakdown and the citations are readable by anyone
+  holding the transaction signature.
 - Response headers set `X-Content-Type-Options`, `X-Frame-Options`,
   `Referrer-Policy` and `Permissions-Policy` on every route.
 - Secrets live only in the environment. `render.yaml` references them with
