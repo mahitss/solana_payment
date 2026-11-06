@@ -12,16 +12,25 @@ import {
   toBaseUnits,
 } from './protocol';
 
+export interface DocumentContribution {
+  document_id: string;
+  document_title: string;
+  chunk_ids: string[];
+  /** Price for this document, in USDC base units (6 dp). */
+  amount_base_units: number;
+  /** Price for this document, in whole USDC. */
+  amount_usdc: number;
+}
+
 export interface PublisherPaymentBreakdown {
   publisher_id: string;
   publisher_wallet: string;
   publisher_name: string;
-  document_id: string;
-  document_title: string;
-  chunk_ids: string[];
-  /** Price charged for this publisher/document, in whole USDC. */
+  /** One contribution per distinct document from this publisher. */
+  documents: DocumentContribution[];
+  /** Aggregated price across all documents from this publisher, in whole USDC. */
   amount_usdc: number;
-  /** Price charged for this publisher/document, in USDC base units (6 dp). */
+  /** Aggregated price across all documents from this publisher, in USDC base units (6 dp). */
   amount_base_units: number;
 }
 
@@ -53,12 +62,13 @@ export async function createPaymentQuote(
   const quoteId = `q_${crypto.randomUUID()}`;
   const quoteNonce = crypto.randomBytes(16).toString('hex');
 
-  // Group by publisher AND document. A publisher who contributes chunks from
-  // two different licensed documents is paid for both - the price is a
-  // "price per query per document", not per publisher.
+  // Group by publisher wallet (not publisher_id + document_id). A publisher
+  // who contributes chunks from multiple licensed documents receives one
+  // aggregated payment at their single USDC ATA. Individual document
+  // contributions are preserved separately in the `documents` array.
   const breakdownMap = new Map<string, PublisherPaymentBreakdown>();
   for (const chunk of matchedChunks) {
-    const key = `${chunk.publisher_id}:${chunk.document_id}`;
+    const key = chunk.publisher_wallet;
     let entry = breakdownMap.get(key);
 
     if (!entry) {
@@ -74,16 +84,44 @@ export async function createPaymentQuote(
         publisher_id: chunk.publisher_id,
         publisher_wallet: chunk.publisher_wallet,
         publisher_name: chunk.publisher_name,
-        document_id: chunk.document_id,
-        document_title: chunk.document_title,
-        chunk_ids: [],
+        documents: [
+          {
+            document_id: chunk.document_id,
+            document_title: chunk.document_title,
+            chunk_ids: [chunk.id],
+            amount_base_units: baseUnits,
+            amount_usdc: fromBaseUnits(baseUnits),
+          },
+        ],
         amount_usdc: fromBaseUnits(baseUnits),
         amount_base_units: baseUnits,
       };
       breakdownMap.set(key, entry);
+      continue;
     }
 
-    entry.chunk_ids.push(chunk.id);
+    // Find or create a document contribution within this publisher entry.
+    const docContribution = entry.documents.find((d) => d.document_id === chunk.document_id);
+    if (!docContribution) {
+      const price = Number.parseFloat(chunk.price_per_query_usdc);
+      if (!Number.isFinite(price) || price <= 0) {
+        throw new Error(
+          `Invalid or missing price for document ${chunk.document_id} (chunk ${chunk.id}). Quotes fail closed on invalid pricing.`
+        );
+      }
+      const baseUnits = toBaseUnits(price);
+      entry.documents.push({
+        document_id: chunk.document_id,
+        document_title: chunk.document_title,
+        chunk_ids: [chunk.id],
+        amount_base_units: baseUnits,
+        amount_usdc: fromBaseUnits(baseUnits),
+      });
+      entry.amount_base_units += baseUnits;
+      entry.amount_usdc = fromBaseUnits(entry.amount_base_units);
+    } else {
+      docContribution.chunk_ids.push(chunk.id);
+    }
   }
 
   const publisherBreakdown = Array.from(breakdownMap.values());

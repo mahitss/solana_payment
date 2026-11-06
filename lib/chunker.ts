@@ -105,7 +105,7 @@ export function chunkText(
  */
 export function parseMarkdown(content: string): string {
   // Strip frontmatter if present
-  let text = content.replace(/^---[\s\S]*?---/, '');
+  const text = content.replace(/^---[\s\S]*?---/, '');
   // Normalize whitespace
   return text.trim();
 }

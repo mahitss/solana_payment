@@ -393,7 +393,7 @@ function finaliseAnswer(raw: string, providerName: string): string {
  * Local Ollama provider. Runs against a self-hosted inference server.
  */
 export class OllamaProvider implements AIProvider {
-  name: 'ollama' = 'ollama';
+  name = 'ollama' as const;
   private baseUrl: string;
   private model: string;
 
@@ -481,7 +481,7 @@ export class OllamaProvider implements AIProvider {
  * Hosted Google Gemini provider.
  */
 export class GeminiProvider implements AIProvider {
-  name: 'gemini' = 'gemini';
+  name = 'gemini' as const;
   private apiKey: string;
   private model: string;
 

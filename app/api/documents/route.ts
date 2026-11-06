@@ -42,7 +42,10 @@ export async function POST(req: Request) {
 
     const contentType = req.headers.get('content-type') || '';
 
-    let publisherWallet = session.wallet;
+    // The publisher wallet comes from the verified session, never from the
+    // request body, so royalties can never be attributed to a wallet the
+    // caller does not control.
+    const publisherWallet = session.wallet;
     let publisherName = '';
     let title = '';
     let fileType: 'pdf' | 'md' = 'md';

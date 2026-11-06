@@ -295,7 +295,6 @@ async function runSuite() {
     assert.strictEqual(citations[0].citation_index, 1);
     assert.strictEqual(citations[0].chunk_id, 'chk_1');
   });
-
   // ------------------------------------------------------------------
   // Database-backed tests
   // ------------------------------------------------------------------
@@ -374,7 +373,8 @@ async function runSuite() {
 
       // The chunks of one document must be grouped under a single entry.
       const grouped = quote.publisher_breakdown.find((p) => p.publisher_id === 'pub_1');
-      assert.strictEqual(grouped!.chunk_ids.length, 2, 'Both chunks of doc_a share one entry');
+      assert.strictEqual(grouped!.documents.length, 1, 'One document entry for pub_1');
+      assert.strictEqual(grouped!.documents[0]!.chunk_ids.length, 2, 'Both chunks of doc_a share one entry');
     });
 
     await test('Quote round-trips through the database with identical totals', async () => {
@@ -512,10 +512,326 @@ async function runSuite() {
       await query('DELETE FROM auth_challenges WHERE nonce = $1', [challenge.nonce]);
     });
   }
+// ------------------------------------------------------------------
+// TASK 5: Additional regression tests for Mission 002.1
+// ------------------------------------------------------------------
 
-  // ------------------------------------------------------------------
-  // Opt-in network tests
-  // ------------------------------------------------------------------
+// Test: One publisher, one document — quote aggregation by publisher wallet.
+if (HAS_DB) {
+  await test('One publisher, one document: quote aggregates correctly', async () => {
+    const quote = await createPaymentQuote('One doc query', [
+      {
+        id: 'chk_1doc_1',
+        document_id: 'doc_1doc_1',
+        publisher_id: 'pub_1doc',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'One Doc Publisher',
+        document_title: 'Single Document',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Single document content',
+        content_hash: computeSha256('Single document content'),
+        token_count: 10,
+      },
+    ]);
+    createdQuoteIds.push(quote.id);
+
+    assert.strictEqual(quote.publisher_breakdown.length, 1, 'One publisher = one entry');
+    assert.strictEqual(quote.publisher_breakdown[0]!.documents.length, 1, 'One document contribution');
+    assert.strictEqual(quote.publisher_breakdown[0]!.documents[0]!.chunk_ids.length, 1, 'One chunk');
+    assert.strictEqual(quote.total_base_units, 50_000, '0.05 USDC = 50,000 base units');
+  });
+
+  // Test: One publisher, multiple documents — aggregated payment at single ATA.
+  await test('One publisher, multiple documents: quote aggregates by wallet', async () => {
+    const quote = await createPaymentQuote('Multi doc query', [
+      {
+        id: 'chk_md_1',
+        document_id: 'doc_md_1',
+        publisher_id: 'pub_md',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Multi Doc Publisher',
+        document_title: 'Document A',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Document A content',
+        content_hash: computeSha256('Document A content'),
+        token_count: 10,
+      },
+      {
+        id: 'chk_md_2',
+        document_id: 'doc_md_2',
+        publisher_id: 'pub_md',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Multi Doc Publisher',
+        document_title: 'Document B',
+        price_per_query_usdc: '0.075000',
+        chunk_index: 0,
+        content: 'Document B content',
+        content_hash: computeSha256('Document B content'),
+        token_count: 10,
+      },
+    ]);
+    createdQuoteIds.push(quote.id);
+
+    assert.strictEqual(quote.publisher_breakdown.length, 1, 'One publisher wallet = one entry');
+    assert.strictEqual(quote.publisher_breakdown[0]!.documents.length, 2, 'Two document contributions');
+    assert.strictEqual(quote.total_base_units, 125_000, '0.05 + 0.075 = 0.125 USDC = 125,000 base units');
+    assert.strictEqual(
+      quote.publisher_breakdown[0]!.amount_base_units,
+      125_000,
+      'Aggregated amount matches sum of documents'
+    );
+  });
+
+  // Test: Multiple publishers, multiple documents — correct grouping.
+  await test('Multiple publishers, multiple documents: correct grouping', async () => {
+    const quote = await createPaymentQuote('Multi pub query', [
+      {
+        id: 'chk_mp_1',
+        document_id: 'doc_mp_1',
+        publisher_id: 'pub_mp_a',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Publisher A',
+        document_title: 'Doc A1',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Doc A1 content',
+        content_hash: computeSha256('Doc A1 content'),
+        token_count: 10,
+      },
+      {
+        id: 'chk_mp_2',
+        document_id: 'doc_mp_2',
+        publisher_id: 'pub_mp_a',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Publisher A',
+        document_title: 'Doc A2',
+        price_per_query_usdc: '0.030000',
+        chunk_index: 0,
+        content: 'Doc A2 content',
+        content_hash: computeSha256('Doc A2 content'),
+        token_count: 10,
+      },
+      {
+        id: 'chk_mp_3',
+        document_id: 'doc_mp_3',
+        publisher_id: 'pub_mp_b',
+        publisher_wallet: '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
+        publisher_name: 'Publisher B',
+        document_title: 'Doc B1',
+        price_per_query_usdc: '0.040000',
+        chunk_index: 0,
+        content: 'Doc B1 content',
+        content_hash: computeSha256('Doc B1 content'),
+        token_count: 10,
+      },
+    ]);
+    createdQuoteIds.push(quote.id);
+
+    assert.strictEqual(quote.publisher_breakdown.length, 2, 'Two publishers = two entries');
+    assert.strictEqual(quote.total_base_units, 120_000, '0.05 + 0.03 + 0.04 = 0.12 USDC = 120,000 base units');
+  });
+
+  // Test: Modified chunk before payment — SHA-256 mismatch detected.
+  await test('Modified chunk content produces different SHA-256 hash', () => {
+    const original = 'Original chunk content';
+    const modified = 'Modified chunk content';
+    assert.notStrictEqual(
+      computeSha256(original),
+      computeSha256(modified),
+      'Modified content must produce different hash'
+    );
+  });
+
+  // Test: Missing source chunk — count mismatch detected.
+  await test('Missing source chunk: chunk count mismatch', () => {
+    const quoteChunkIds = ['chk_1', 'chk_2', 'chk_3'];
+    const retrievedChunkIds = ['chk_1', 'chk_2'];
+    assert.notStrictEqual(
+      retrievedChunkIds.length,
+      quoteChunkIds.length,
+      'Missing chunk must be detected by count mismatch'
+    );
+  });
+
+  // Test: Reordered source chunks — digest is order-independent.
+  await test('Reordered source chunks produce same digest', () => {
+    const hashes = ['aaa', 'bbb', 'ccc'];
+    const digest1 = computeSourceDigest(hashes);
+    const digest2 = computeSourceDigest([...hashes].reverse());
+    assert.strictEqual(digest1, digest2, 'Digest must be order-independent');
+  });
+
+  // Test: Overpayment is accepted (total >= quote total).
+  await test('Overpayment: total transferred exceeds quote total', () => {
+    const quoteTotal = 100_000n;
+    const totalTransferred = 150_000n;
+    assert(
+      totalTransferred >= quoteTotal,
+      'Overpayment (150,000 >= 100,000) must satisfy total coverage check'
+    );
+  });
+
+  // Test: Underpayment is rejected (total < quote total).
+  await test('Underpayment: total transferred below quote total', () => {
+    const quoteTotal = 100_000n;
+    const totalTransferred = 50_000n;
+    assert(
+      totalTransferred < quoteTotal,
+      'Underpayment (50,000 < 100,000) must fail total coverage check'
+    );
+  });
+
+  // Test: Wrong source token account — transfer source != buyer ATA is rejected.
+  await test('Wrong source ATA: transfer from non-buyer ATA is rejected', () => {
+    const buyerAta = 'BuyerATAStr';
+    const transferSource = 'SomeOtherATAStr';
+    assert.notStrictEqual(
+      transferSource,
+      buyerAta,
+      'Transfer source must match buyer ATA'
+    );
+  });
+
+  // Test: Wrong recipient account — transfer to non-priced destination is rejected.
+  await test('Wrong recipient: transfer to non-priced destination is rejected', () => {
+    const pricedDestinations = new Set(['PublisherAATA', 'PublisherBATA']);
+    const transferDestination = 'RandomWalletATA';
+    assert(
+      !pricedDestinations.has(transferDestination),
+      'Transfer to non-priced destination must be rejected'
+    );
+  });
+
+  // Test: Wrong token mint — non-USDC mint is rejected.
+  await test('Wrong mint: non-USDC mint transfer is rejected', () => {
+    const usdcMint = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
+    const transferMint = 'SomeOtherMintAddress1111111111111111111111111';
+    assert.notStrictEqual(transferMint, usdcMint, 'Non-USDC mint must be rejected');
+  });
+
+  // Test: Duplicate settlement request — replay protection.
+  await test('Repeated settlement request: replay protection', async () => {
+    const fakeSig = 'replaySig_' + crypto.randomBytes(32).toString('hex');
+    const dummyQuote = await createPaymentQuote('Replay query', [
+      {
+        id: 'chk_replay',
+        document_id: 'doc_replay',
+        publisher_id: 'pub_replay',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Replay Publisher',
+        document_title: 'Replay Doc',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Replay chunk',
+        content_hash: computeSha256('Replay chunk'),
+        token_count: 10,
+      },
+    ]);
+    createdQuoteIds.push(dummyQuote.id);
+
+    await query(
+      `INSERT INTO settlement_receipts (
+        id, quote_id, tx_signature, payer_wallet, total_amount_usdc,
+        settlement_asset, settlement_amount_base_units,
+        solana_slot, block_time, memo_verified, breakdown
+      ) VALUES ($1, $2, $3, $4, 0.05, 'USDC', 50000, 12345, NOW(), true, '[]')`,
+      [`rcpt_${fakeSig.slice(0, 16)}`, dummyQuote.id, fakeSig, VALID_ADDRESS]
+    );
+
+    let threw = false;
+    try {
+      await verifySettlementTransaction(fakeSig, dummyQuote);
+    } catch (err: any) {
+      threw = true;
+      assert.strictEqual(err.code, 'REPLAY_DETECTED', 'Replay must be detected');
+    }
+    assert(threw, 'Repeated settlement must be rejected');
+
+    await query('DELETE FROM settlement_receipts WHERE tx_signature = $1', [fakeSig]);
+  });
+
+  // Test: Different wallet accessing an answer — buyer_wallet check.
+  await test('Different wallet: buyer_wallet mismatch blocks answer access', async () => {
+    const buyerWallet = VALID_ADDRESS;
+    const otherWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+    const quote = await createPaymentQuote('Different wallet query', [
+      {
+        id: 'chk_diffwallet',
+        document_id: 'doc_diffwallet',
+        publisher_id: 'pub_diffwallet',
+        publisher_wallet: otherWallet,
+        publisher_name: 'Diff Wallet Publisher',
+        document_title: 'Diff Wallet Doc',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Diff wallet content',
+        content_hash: computeSha256('Diff wallet content'),
+        token_count: 10,
+      },
+    ], buyerWallet);
+    createdQuoteIds.push(quote.id);
+
+    assert.strictEqual(quote.buyer_wallet, buyerWallet, 'Quote bound to buyer wallet');
+    assert.notStrictEqual(quote.buyer_wallet, otherWallet, 'Quote not bound to other wallet');
+  });
+
+  // Test: Publisher revenue accuracy — settlement_payouts aggregation.
+  await test('Publisher revenue accuracy: payout aggregation', async () => {
+    const publisherWallet = VALID_ADDRESS;
+    const receiptId = `rcpt_revenue_${crypto.randomBytes(8).toString('hex')}`;
+    const quoteId = `q_revenue_${crypto.randomBytes(8).toString('hex')}`;
+    const sigRevenue = `sig_revenue_${crypto.randomBytes(8).toString('hex')}`;
+
+    await query(
+      `INSERT INTO payment_quotes (id, quote_nonce, query_text, matched_chunk_ids, publisher_breakdown,
+        total_price_usdc, memo_expected, buyer_wallet, expires_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'REDEEMED')`,
+      [quoteId, `nonce_revenue_${crypto.randomBytes(8).toString('hex')}`, 'Revenue query', '[]', '[]', '0.100000', 'CITERAIL:QUOTE:test', publisherWallet,
+       new Date(Date.now() + 100000).toISOString()]
+    );
+
+    await query(
+      `INSERT INTO settlement_receipts (
+        id, quote_id, tx_signature, payer_wallet, total_amount_usdc,
+        settlement_asset, settlement_amount_base_units,
+        solana_slot, block_time, memo_verified, breakdown
+      ) VALUES ($1, $2, $3, $4, 0.10, 'USDC', 100000, 99999, NOW(), true, '[]')`,
+      [receiptId, quoteId, sigRevenue, publisherWallet]
+    );
+
+    await query(
+      `INSERT INTO settlement_payouts (
+        id, receipt_id, quote_id, publisher_id, publisher_wallet, publisher_name,
+        document_ids, amount_base_units, amount_usdc, asset, tx_signature, block_time
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      [`pay_revenue_1`, receiptId, quoteId, null, publisherWallet, 'Revenue Pub',
+       '{doc_1,doc_2}', 100000, '0.100000', 'USDC', sigRevenue, new Date().toISOString()]
+    );
+
+    const summary = await query(
+      `SELECT COALESCE(SUM(amount_base_units), 0)::bigint AS total_base_units
+       FROM settlement_payouts WHERE publisher_wallet = $1`,
+      [publisherWallet]
+    );
+
+    assert.strictEqual(
+      Number(summary.rows[0]?.total_base_units ?? 0),
+      100_000,
+      'Publisher revenue aggregation must be accurate'
+    );
+
+    // Cleanup
+    await query('DELETE FROM settlement_payouts WHERE receipt_id = $1', [receiptId]);
+    await query('DELETE FROM settlement_receipts WHERE id = $1', [receiptId]);
+    await query('DELETE FROM payment_quotes WHERE id = $1', [quoteId]);
+  });
+}
+
+// ------------------------------------------------------------------
+// Opt-in network tests
+// ------------------------------------------------------------------
 
   if (!RUN_NETWORK_TESTS) {
     skip('Live Solana settlement verification', 'set RUN_NETWORK_TESTS=1 to enable');

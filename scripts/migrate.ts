@@ -190,6 +190,7 @@ async function migrate() {
         publisher_id VARCHAR(64) REFERENCES publishers(id) ON DELETE SET NULL,
         publisher_wallet VARCHAR(44) NOT NULL,
         publisher_name VARCHAR(100),
+        document_ids TEXT[],
         amount_base_units BIGINT NOT NULL,
         amount_usdc NUMERIC(12, 6) NOT NULL,
         asset VARCHAR(16) NOT NULL DEFAULT 'USDC',
@@ -197,6 +198,12 @@ async function migrate() {
         block_time TIMESTAMP WITH TIME ZONE NOT NULL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+
+    // Backfill document_ids for existing payouts that lack the column.
+    await client.query(`
+      ALTER TABLE settlement_payouts
+        ADD COLUMN IF NOT EXISTS document_ids TEXT[];
     `);
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_payouts_receipt_wallet

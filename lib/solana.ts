@@ -107,7 +107,7 @@ function collectInstructions(tx: ParsedTransactionWithMeta): Array<
 function usdcBalanceDelta(
   tx: ParsedTransactionWithMeta,
   owner: string
-): number {
+): bigint {
   const mint = DEVNET_USDC_MINT.toBase58();
   const pre = tx.meta?.preTokenBalances?.find(
     (b) => b.owner === owner && b.mint === mint
@@ -116,8 +116,8 @@ function usdcBalanceDelta(
     (b) => b.owner === owner && b.mint === mint
   );
 
-  const preAmt = Number.parseInt(pre?.uiTokenAmount.amount || '0', 10);
-  const postAmt = Number.parseInt(post?.uiTokenAmount.amount || '0', 10);
+  const preAmt = BigInt(pre?.uiTokenAmount.amount || '0');
+  const postAmt = BigInt(post?.uiTokenAmount.amount || '0');
 
   return postAmt - preAmt;
 }
@@ -125,7 +125,7 @@ function usdcBalanceDelta(
 interface SplTransfer {
   destination: string;
   source: string;
-  amount: number;
+  amount: bigint;
   /** Mint when the instruction discloses it (transferChecked). */
   mint?: string;
 }
@@ -152,10 +152,10 @@ function extractSplTransfers(
     if (!info) continue;
 
     const amount = info.tokenAmount
-      ? Number.parseInt(info.tokenAmount.amount, 10)
-      : Number.parseInt(info.amount, 10);
+      ? BigInt(info.tokenAmount.amount)
+      : BigInt(info.amount);
 
-    if (!Number.isFinite(amount)) continue;
+    if (amount <= 0n) continue;
 
     transfers.push({
       destination: String(info.destination ?? ''),
@@ -330,8 +330,8 @@ export async function verifySettlementTransaction(
     publisher_id: string;
     publisher_wallet: string;
     publisher_name: string;
-    document_id: string;
-    document_title: string;
+    document_ids: string[];
+    document_titles: string[];
     expected_amount: bigint;
     received_amount: bigint;
     verified: boolean;
@@ -364,7 +364,7 @@ export async function verifySettlementTransaction(
       // Source must be the buyer's ATA (third-party funding rejected).
       if (transfer.source !== payerAtaStr) continue;
 
-      const amount = BigInt(transfer.amount);
+      const amount = transfer.amount;
       if (amount <= 0n) continue;
 
       amountReceivedForPub += amount;
@@ -374,8 +374,8 @@ export async function verifySettlementTransaction(
     // Cross-check against the mint-filtered balance delta. This path is
     // immune to mint confusion entirely and uses BigInt.
     const balanceDelta = usdcBalanceDelta(tx, pub.publisher_wallet);
-    if (balanceDelta > Number(amountReceivedForPub)) {
-      amountReceivedForPub = BigInt(balanceDelta);
+    if (balanceDelta > amountReceivedForPub) {
+      amountReceivedForPub = balanceDelta;
     }
 
     const expectedAmount = BigInt(pub.amount_base_units);
@@ -387,12 +387,15 @@ export async function verifySettlementTransaction(
     }
 
     totalTransferredBaseUnits += amountReceivedForPub;
+    // Flatten all document IDs and titles from this publisher's contributions.
+    const allDocumentIds = pub.documents.flatMap((d) => d.document_id);
+    const allDocumentTitles = pub.documents.map((d) => d.document_title);
     verifiedBreakdown.push({
       publisher_id: pub.publisher_id,
       publisher_wallet: pub.publisher_wallet,
       publisher_name: pub.publisher_name,
-      document_id: pub.document_id,
-      document_title: pub.document_title,
+      document_ids: allDocumentIds,
+      document_titles: allDocumentTitles,
       expected_amount: expectedAmount,
       received_amount: amountReceivedForPub,
       verified: true,
@@ -401,9 +404,10 @@ export async function verifySettlementTransaction(
 
   // 8. Verify the payer was actually debited in USDC.
   const payerDelta = usdcBalanceDelta(tx, feePayer);
-  if (payerDelta > -quote.total_base_units) {
+  const expectedPayerDebit = -BigInt(quote.total_base_units);
+  if (payerDelta > expectedPayerDebit) {
     throw new SolanaVerificationError(
-      `Payer USDC balance decreased by ${Math.abs(payerDelta)} base units, but the quote requires ${quote.total_base_units} base units.`,
+      `Payer USDC balance decreased by ${Math.abs(Number(payerDelta))} base units, but the quote requires ${quote.total_base_units} base units.`,
       'PAYER_NOT_DEBITED'
     );
   }
@@ -463,8 +467,8 @@ export async function verifySettlementTransaction(
       await client.query(
         `INSERT INTO settlement_payouts (
            id, receipt_id, quote_id, publisher_id, publisher_wallet, publisher_name,
-           amount_base_units, amount_usdc, asset, tx_signature, block_time
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           document_ids, amount_base_units, amount_usdc, asset, tx_signature, block_time
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (receipt_id, publisher_wallet) DO NOTHING`,
         [
           `pay_${crypto.randomUUID()}`,
@@ -473,6 +477,7 @@ export async function verifySettlementTransaction(
           item.publisher_id,
           item.publisher_wallet,
           item.publisher_name,
+          item.document_ids,
           item.received_amount,
           formatUsdc(Number(item.received_amount)),
           SETTLEMENT_ASSET,

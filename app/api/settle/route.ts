@@ -12,14 +12,6 @@ import { requireAuth, AuthError } from '@/lib/auth';
 
 export const dynamic = 'force-dynamic';
 
-interface ExecutionRow {
-  id: string;
-  ai_provider: string;
-  ai_model: string;
-  generated_answer: string;
-  citations: any;
-}
-
 /**
  * Settles a quote.
  *
@@ -136,15 +128,10 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3. Perform Server-Side On-Chain Settlement Verification.
-    //    The expected payer is derived from the quote's buyer_wallet, not
-    //    from the request body (Task 2, item 6 & 7).
-    const receipt = await verifySettlementTransaction(txSignature, quote, buyerWallet);
-
-    // TASK 4: Source Integrity — fetch exactly the chunk IDs stored in the
-    // quote, preserve order, recalculate SHA-256 hashes, recompute the
-    // combined source digest, and verify it against the digest committed
-    // in the quote memo. Reject missing or modified chunks.
+    // TASK 3: Source Integrity BEFORE settlement — verify exact purchased
+    // chunks before allowing payment. Check every chunk's SHA-256 hash,
+    // verify the combined source digest, ensure retrieved chunk IDs match
+    // the quote exactly, and preserve deterministic source order.
     const chunksRes = await query<ChunkRecord>(
       `SELECT
          c.id, c.document_id, c.publisher_id, c.chunk_index, c.content, c.content_hash, c.token_count,
@@ -161,12 +148,25 @@ export async function POST(req: Request) {
     const chunks = chunksRes.rows;
 
     if (chunks.length !== quote.matched_chunk_ids.length) {
-      // Reject missing chunks — no partial fulfillment.
+      // Reject missing chunks — no partial fulfillment, no receipt written.
       return NextResponse.json(
         {
           success: false,
           error:
-            'Some purchased knowledge sources are no longer available. The receipt has been recorded; please contact support.',
+            'Some purchased knowledge sources are no longer available. No settlement was recorded.',
+        },
+        { status: 409 }
+      );
+    }
+
+    // Verify chunk IDs match the quote exactly, in deterministic order.
+    const retrievedIds = chunks.map((c) => c.id);
+    const expectedIds = [...quote.matched_chunk_ids];
+    if (JSON.stringify(retrievedIds.sort()) !== JSON.stringify(expectedIds.sort())) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'Retrieved chunk IDs do not match the quoted sources.',
         },
         { status: 409 }
       );
@@ -199,7 +199,72 @@ export async function POST(req: Request) {
       );
     }
 
-    // 5. Grounded AI Generation (fails closed when no provider is reachable)
+    // 3. Perform Server-Side On-Chain Settlement Verification.
+    //    Only reached after source integrity has been verified. The expected
+    //    payer is derived from the quote's buyer_wallet, not from the request body.
+    const receipt = await verifySettlementTransaction(txSignature, quote, buyerWallet);
+
+    // TASK 3, item 8: Validate source integrity again before AI generation.
+    // Re-fetch chunks and re-verify to prevent modification between integrity
+    // check and settlement. This is a defense-in-depth check.
+    const postSettlementChunksRes = await query<ChunkRecord>(
+      `SELECT
+         c.id, c.document_id, c.publisher_id, c.chunk_index, c.content, c.content_hash, c.token_count,
+         d.title as document_title, d.price_per_query_usdc,
+         p.wallet_address as publisher_wallet, p.name as publisher_name
+       FROM document_chunks c
+       JOIN documents d ON c.document_id = d.id
+       JOIN publishers p ON c.publisher_id = p.id
+       WHERE c.id = ANY($1::varchar[])
+       ORDER BY c.chunk_index ASC`,
+      [quote.matched_chunk_ids]
+    );
+
+    const postSettlementChunks = postSettlementChunksRes.rows;
+    if (postSettlementChunks.length !== quote.matched_chunk_ids.length) {
+      return NextResponse.json(
+        {
+          success: false,
+          paymentSettled: true,
+          error:
+            'Some purchased knowledge sources are no longer available after settlement. The receipt has been recorded; please contact support.',
+        },
+        { status: 409 }
+      );
+    }
+
+    for (const chunk of postSettlementChunks) {
+      const recalculatedHash = computeSha256(chunk.content);
+      if (recalculatedHash !== chunk.content_hash) {
+        return NextResponse.json(
+          {
+            success: false,
+            paymentSettled: true,
+            error: `Source integrity check failed for chunk ${chunk.id} after settlement: content has been modified.`,
+          },
+          { status: 409 }
+        );
+      }
+    }
+
+    const postSettlementDigest = computeSourceDigest(
+      postSettlementChunks.map((c) => c.content_hash)
+    );
+    if (postSettlementDigest !== memoDigest) {
+      return NextResponse.json(
+        {
+          success: false,
+          paymentSettled: true,
+          error: 'Source digest mismatch after settlement.',
+        },
+        { status: 409 }
+      );
+    }
+
+    // Use post-settlement chunks for AI generation.
+    const aiChunks = postSettlementChunks;
+
+    // 4. Grounded AI Generation (fails closed when no provider is reachable)
     let generated: {
       answer: string;
       citations: any;
@@ -208,7 +273,7 @@ export async function POST(req: Request) {
     };
 
     try {
-      generated = await generateAndRecord(quote, receipt.id, chunks);
+      generated = await generateAndRecord(quote, receipt.id, aiChunks);
     } catch (aiErr: any) {
       // The payment is verified and recorded. Report that clearly instead of
       // pretending the whole operation failed - the consumer can retry.
@@ -244,8 +309,45 @@ export async function POST(req: Request) {
   }
 }
 
+/**
+ * TASK 3: Validate source integrity before AI generation.
+ * Checks every chunk's SHA-256 hash and verifies the combined source digest
+ * against the memo commitment.
+ */
+function validateSourceIntegrity(
+  chunks: ChunkRecord[],
+  memoExpected: string
+): void {
+  const memoDigest = memoExpected.split(':').pop() || '';
+
+  // Recalculate each SHA-256 content hash and verify against stored hash.
+  for (const chunk of chunks) {
+    const recalculatedHash = computeSha256(chunk.content);
+    if (recalculatedHash !== chunk.content_hash) {
+      throw new Error(
+        `Source integrity check failed for chunk ${chunk.id}: content has been modified.`
+      );
+    }
+  }
+
+  // Recalculate the combined source digest and verify against the memo.
+  const recalculatedDigest = computeSourceDigest(
+    chunks.map((c) => c.content_hash)
+  );
+  if (recalculatedDigest !== memoDigest) {
+    throw new Error(
+      'Source digest mismatch: purchased content does not match the quoted sources.'
+    );
+  }
+}
+
 async function generateAndRecord(
-  quote: { id: string; query_text: string; matched_chunk_ids: string[] },
+  quote: {
+    id: string;
+    query_text: string;
+    matched_chunk_ids: string[];
+    memo_expected: string;
+  },
   receiptId: string,
   preloadedChunks?: ChunkRecord[]
 ): Promise<{
@@ -272,9 +374,12 @@ async function generateAndRecord(
     chunks = chunksRes.rows;
   }
 
-  if (!chunks || chunks.length === 0) {
+  if (!chunks || chunks.length !== quote.matched_chunk_ids.length) {
     throw new Error('The paid knowledge sources are no longer available.');
   }
+
+  // TASK 3, item 8: Validate source integrity again before AI generation.
+  validateSourceIntegrity(chunks, quote.memo_expected);
 
   const aiProvider = await getActiveAIProvider();
   const groundedResult = await aiProvider.generateAnswer(quote.query_text, chunks);

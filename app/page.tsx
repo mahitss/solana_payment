@@ -26,7 +26,6 @@ interface MatchedSourcePreview {
   publisher_name: string;
   publisher_wallet: string;
   price_usdc: string;
-  preview_snippet: string;
 }
 
 interface QuoteData {
@@ -155,11 +154,14 @@ function CiteRailDashboard() {
   /**
    * Proves ownership of the connected wallet by signing a server-issued
    * challenge. The resulting bearer token authorises publisher operations.
+   *
+   * Returns the new token so callers can use it immediately, without waiting
+   * for React to re-render with the updated state.
    */
-  const authenticate = async () => {
+  const authenticate = async (): Promise<string | null> => {
     if (!publicKey) {
       setAuthError('Connect a wallet first.');
-      return;
+      return null;
     }
 
     setIsAuthenticating(true);
@@ -195,23 +197,44 @@ function CiteRailDashboard() {
       setAuthToken(verifyData.token);
       setAuthWallet(verifyData.wallet);
       await fetchPublisherEconomics(verifyData.wallet, verifyData.token);
+      return verifyData.token as string;
     } catch (err: any) {
       setAuthError(err.message);
+      return null;
     } finally {
       setIsAuthenticating(false);
     }
   };
 
   // Load economics whenever a valid session becomes available.
+  // Defer the state update to avoid cascading renders inside an effect.
   useEffect(() => {
     if (!sessionToken || !publicKey) return;
-    void fetchPublisherEconomics(publicKey, sessionToken);
+    const timer = setTimeout(() => {
+      void fetchPublisherEconomics(publicKey, sessionToken);
+    }, 0);
+    return () => clearTimeout(timer);
   }, [sessionToken, publicKey, fetchPublisherEconomics]);
 
   // 1. Consumer: Request Quote
   const handleRequestQuote = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!queryInput.trim()) return;
+
+    // Buyer must authenticate before requesting a quote. Use the returned
+    // token immediately rather than relying on stale React state.
+    let token = sessionToken;
+    if (!token) {
+      if (!publicKey) {
+        setQuoteError('Connect your wallet to request a quote.');
+        return;
+      }
+      token = await authenticate();
+      if (!token) {
+        setQuoteError('Wallet authentication is required to request a quote.');
+        return;
+      }
+    }
 
     setIsQuoting(true);
     setQuote(null);
@@ -225,11 +248,10 @@ function CiteRailDashboard() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
           query: queryInput.trim(),
-          buyerWallet: publicKey || undefined,
         }),
       });
 
@@ -256,18 +278,17 @@ function CiteRailDashboard() {
   const handlePayAndSettle = async () => {
     if (!quote) return;
 
-    // Buyer must authenticate before settling.
-    if (!authToken) {
+    // The redemption is bound to the authenticated buyer. This prevents a
+    // third party who observes a transaction signature from redeeming the
+    // answer that the buyer paid for.
+    let token = sessionToken;
+    if (!token) {
       if (!publicKey) {
         setSettlementError('Connect your wallet to settle.');
         return;
       }
-      try {
-        await authenticate();
-      } catch {
-        return;
-      }
-      if (!authToken) {
+      token = await authenticate();
+      if (!token) {
         setSettlementError('Wallet authentication is required to settle.');
         return;
       }
@@ -289,12 +310,12 @@ function CiteRailDashboard() {
       });
 
       // 2. Send transaction signature to server-side settlement gatekeeper.
-      //    The buyer wallet is derived from the session, never from the body.
+      //    The expected payer is derived from the session, never from the body.
       const settleRes = await fetch('/api/settle', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${authToken}`,
+          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
           quoteId: quote.id,
@@ -334,8 +355,8 @@ function CiteRailDashboard() {
       });
 
       // Refresh publisher economics if publisher is connected
-      if (publicKey && authToken) {
-        fetchPublisherEconomics(publicKey, authToken);
+      if (publicKey && token) {
+        fetchPublisherEconomics(publicKey, token);
       }
     } catch (err: any) {
       console.error(err);
@@ -351,9 +372,17 @@ function CiteRailDashboard() {
 
     // Publishing requires proof of wallet ownership. Without it anyone could
     // publish under any wallet address and collect the royalties.
-    if (!authToken) {
-      setUploadError('Sign in with your wallet before publishing.');
-      return;
+    let token = sessionToken;
+    if (!token) {
+      if (!publicKey) {
+        setUploadError('Connect your wallet to publish.');
+        return;
+      }
+      token = await authenticate();
+      if (!token) {
+        setUploadError('Sign in with your wallet before publishing.');
+        return;
+      }
     }
     if (!publicKey || authWallet !== publicKey) {
       setUploadError('Your wallet session is not active. Please sign in again.');
@@ -373,7 +402,7 @@ function CiteRailDashboard() {
     setUploadSuccess(null);
 
     try {
-      const authHeaders = { Authorization: `Bearer ${authToken}` };
+      const authHeaders = { Authorization: `Bearer ${token}` };
       let res;
       if (docFileType === 'pdf') {
         if (!pdfFile) {
@@ -416,7 +445,7 @@ function CiteRailDashboard() {
       setDocTitle('');
       setDocContent('');
       setPdfFile(null);
-      fetchPublisherEconomics(publicKey, authToken);
+      fetchPublisherEconomics(publicKey, token);
     } catch (err: any) {
       setUploadError(err.message);
     } finally {
@@ -582,7 +611,7 @@ function CiteRailDashboard() {
                   }}
                   className="underline hover:text-purple-400 transition"
                 >
-                  "How does CiteRail atomic royalty settlement work?"
+                  &quot;How does CiteRail atomic royalty settlement work?&quot;
                 </button>
                 <span>•</span>
                 <button
@@ -592,7 +621,7 @@ function CiteRailDashboard() {
                   }}
                   className="underline hover:text-purple-400 transition"
                 >
-                  "Verifiable AI citations non-negotiables"
+                  &quot;Verifiable AI citations non-negotiables&quot;
                 </button>
               </div>
             </form>
@@ -759,7 +788,7 @@ function CiteRailDashboard() {
                             </span>
                           </div>
                           <p className="text-gray-400 text-[11px] italic line-clamp-2">
-                            "{c.snippet}"
+                            &quot;{c.snippet}&quot;
                           </p>
                           <div className="text-[10px] text-gray-500 font-mono">
                             Publisher: {c.publisher_name} ({c.publisher_wallet.slice(0, 4)}..{c.publisher_wallet.slice(-4)})
@@ -865,7 +894,7 @@ function CiteRailDashboard() {
               {/* Wallet ownership proof */}
               <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-gray-800 bg-[#12141d] p-4">
                 <div className="text-xs text-gray-400">
-                  {authToken ? (
+                  {sessionToken ? (
                     <span className="flex items-center gap-2 text-emerald-400">
                       <ShieldCheck className="w-4 h-4" />
                       Wallet verified &mdash; publishing as{' '}
@@ -885,7 +914,7 @@ function CiteRailDashboard() {
                     </span>
                   )}
                 </div>
-                {!authToken && (
+                {!sessionToken && (
                   <button
                     type="button"
                     onClick={authenticate}
@@ -916,7 +945,7 @@ function CiteRailDashboard() {
                     </label>
                     <input
                       type="text"
-                      value={publisherWalletInput}
+                      value={publicKey ?? ''}
                       readOnly
                       placeholder="Connect a wallet to publish"
                       className="w-full bg-[#161824] border border-gray-700 rounded-xl px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-purple-500 font-mono cursor-not-allowed"
@@ -1024,7 +1053,7 @@ function CiteRailDashboard() {
 
                 <button
                   type="submit"
-                  disabled={isUploading || !authToken}
+                  disabled={isUploading || !sessionToken}
                   className="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white font-bold py-3 px-6 rounded-xl transition shadow-lg shadow-purple-600/30 flex items-center justify-center gap-2 text-sm"
                 >
                   {isUploading ? (
@@ -1165,7 +1194,7 @@ function CiteRailDashboard() {
                   </div>
                   <div className="flex justify-between py-1 border-b border-gray-800/40">
                     <span className="text-gray-500">Query Text:</span>
-                    <span className="text-gray-200 font-sans italic">"{verifiedReceipt.queryText}"</span>
+                    <span className="text-gray-200 font-sans italic">&quot;{verifiedReceipt.queryText}&quot;</span>
                   </div>
                 </div>
 
