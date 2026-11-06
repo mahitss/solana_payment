@@ -140,6 +140,43 @@ async function migrate() {
     `);
 
     // ------------------------------------------------------------------
+    // Quote source snapshots (immutable)
+    //
+    // Stores an immutable snapshot of every source chunk priced in a quote.
+    // This prevents time-of-check/time-of-use attacks where live chunks are
+    // modified between quote creation and settlement. Snapshots are write-once
+    // and never exposed through public APIs.
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS payment_quote_sources (
+        id VARCHAR(64) PRIMARY KEY,
+        quote_id VARCHAR(64) NOT NULL REFERENCES payment_quotes(id) ON DELETE CASCADE,
+        ordinal INT NOT NULL,
+        chunk_id VARCHAR(64) NOT NULL,
+        document_id VARCHAR(64) NOT NULL,
+        publisher_id VARCHAR(64) NOT NULL,
+        publisher_wallet VARCHAR(44) NOT NULL,
+        document_title VARCHAR(255) NOT NULL,
+        source_content TEXT NOT NULL,
+        source_sha256 VARCHAR(64) NOT NULL,
+        document_price_base_units BIGINT NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_quote_sources_quote_ordinal
+        ON payment_quote_sources(quote_id, ordinal);
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_quote_sources_chunk
+        ON payment_quote_sources(chunk_id);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_quote_sources_quote
+        ON payment_quote_sources(quote_id);
+    `);
+
+    // ------------------------------------------------------------------
     // Settlement receipts
     // ------------------------------------------------------------------
     await client.query(`
@@ -191,6 +228,7 @@ async function migrate() {
         publisher_wallet VARCHAR(44) NOT NULL,
         publisher_name VARCHAR(100),
         document_ids TEXT[],
+        document_allocations JSONB,
         amount_base_units BIGINT NOT NULL,
         amount_usdc NUMERIC(12, 6) NOT NULL,
         asset VARCHAR(16) NOT NULL DEFAULT 'USDC',
@@ -204,6 +242,10 @@ async function migrate() {
     await client.query(`
       ALTER TABLE settlement_payouts
         ADD COLUMN IF NOT EXISTS document_ids TEXT[];
+    `);
+    await client.query(`
+      ALTER TABLE settlement_payouts
+        ADD COLUMN IF NOT EXISTS document_allocations JSONB;
     `);
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_payouts_receipt_wallet

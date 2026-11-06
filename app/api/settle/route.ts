@@ -1,9 +1,8 @@
 import { NextResponse } from 'next/server';
-import { getQuote } from '@/lib/quotes';
+import { getQuote, getQuoteSources } from '@/lib/quotes';
 import { verifySettlementTransaction, SolanaVerificationError } from '@/lib/solana';
 import { getActiveAIProvider } from '@/lib/ai/provider';
 import { query } from '@/lib/db';
-import { ChunkRecord } from '@/lib/documents';
 import { SETTLEMENT_ASSET } from '@/lib/protocol';
 import { computeSha256 } from '@/lib/chunker';
 import { computeSourceDigest } from '@/lib/protocol';
@@ -108,8 +107,38 @@ export async function POST(req: Request) {
         });
       }
 
-      // Paid, but the answer was never generated. Produce it now.
-      const answer = await generateAndRecord(quote, row.id);
+      // Paid, but the answer was never generated. Produce it now from the
+      // immutable snapshot (TASK 3, item 11: redeemed-quote retries use the
+      // same snapshot; item 12: retry repeats snapshot validation).
+      const snapshots = await getQuoteSources(quote.id);
+      if (snapshots.length === 0) {
+        return NextResponse.json(
+          { success: false, error: 'No source snapshots found for this quote.' },
+          { status: 409 }
+        );
+      }
+      const snapshotIntegrity = snapshots.map((s) => ({
+        content: s.source_content,
+        content_hash: s.source_sha256,
+        id: s.chunk_id,
+      }));
+      validateSnapshotIntegrity(snapshotIntegrity, quote.memo_expected);
+
+      const aiChunks = snapshots.map((s) => ({
+        id: s.chunk_id,
+        document_id: s.document_id,
+        publisher_id: s.publisher_id,
+        publisher_wallet: s.publisher_wallet,
+        publisher_name: s.document_title,
+        document_title: s.document_title,
+        content: s.source_content,
+        content_hash: s.source_sha256,
+        price_per_query_usdc: s.document_price_base_units,
+        token_count: 0,
+        chunk_index: s.ordinal,
+      }));
+
+      const answer = await generateAndRecord(quote, row.id, aiChunks);
       return NextResponse.json({
         success: true,
         alreadySettled: true,
@@ -129,65 +158,66 @@ export async function POST(req: Request) {
     }
 
     // TASK 3: Source Integrity BEFORE settlement — verify exact purchased
-    // chunks before allowing payment. Check every chunk's SHA-256 hash,
-    // verify the combined source digest, ensure retrieved chunk IDs match
-    // the quote exactly, and preserve deterministic source order.
-    const chunksRes = await query<ChunkRecord>(
-      `SELECT
-         c.id, c.document_id, c.publisher_id, c.chunk_index, c.content, c.content_hash, c.token_count,
-         d.title as document_title, d.price_per_query_usdc,
-         p.wallet_address as publisher_wallet, p.name as publisher_name
-       FROM document_chunks c
-       JOIN documents d ON c.document_id = d.id
-       JOIN publishers p ON c.publisher_id = p.id
-       WHERE c.id = ANY($1::varchar[])
-       ORDER BY c.chunk_index ASC`,
-      [quote.matched_chunk_ids]
-    );
-
-    const chunks = chunksRes.rows;
-
-    if (chunks.length !== quote.matched_chunk_ids.length) {
-      // Reject missing chunks — no partial fulfillment, no receipt written.
+    // chunks from the immutable snapshot before allowing payment. Check every
+    // chunk's SHA-256 hash, verify the combined source digest, ensure
+    // retrieved chunk IDs match the quote exactly, and preserve deterministic
+    // source order.
+    const snapshots = await getQuoteSources(quote.id);
+    if (snapshots.length === 0) {
       return NextResponse.json(
         {
           success: false,
           error:
-            'Some purchased knowledge sources are no longer available. No settlement was recorded.',
+            'No source snapshots found for this quote. No settlement was recorded.',
         },
         { status: 409 }
       );
     }
 
-    // Verify chunk IDs match the quote exactly, in deterministic order.
-    const retrievedIds = chunks.map((c) => c.id);
-    const expectedIds = [...quote.matched_chunk_ids];
-    if (JSON.stringify(retrievedIds.sort()) !== JSON.stringify(expectedIds.sort())) {
+    // Verify snapshot count matches the quote's matched chunks.
+    if (snapshots.length !== quote.matched_chunk_ids.length) {
       return NextResponse.json(
         {
           success: false,
-          error: 'Retrieved chunk IDs do not match the quoted sources.',
+          error:
+            'Snapshot chunk count does not match the quoted sources. No settlement was recorded.',
         },
         { status: 409 }
       );
     }
 
-    // Recalculate each SHA-256 content hash and verify against stored hash.
-    for (const chunk of chunks) {
-      const recalculatedHash = computeSha256(chunk.content);
-      if (recalculatedHash !== chunk.content_hash) {
+    // Verify snapshot ordinal order is deterministic (0, 1, 2, ...).
+    const ordinals = snapshots.map((s) => s.ordinal).sort((a, b) => a - b);
+    for (let i = 0; i < ordinals.length; i++) {
+      if (ordinals[i] !== i) {
         return NextResponse.json(
           {
             success: false,
-            error: `Source integrity check failed for chunk ${chunk.id}: content has been modified.`,
+            error: 'Snapshot ordinal order is inconsistent. No settlement was recorded.',
           },
           { status: 409 }
         );
       }
     }
 
-    // Recalculate the combined source digest and verify against the memo.
-    const recalculatedDigest = computeSourceDigest(chunks.map((c) => c.content_hash));
+    // Verify each snapshot's SHA-256 hash against its stored hash.
+    for (const snapshot of snapshots) {
+      const recalculatedHash = computeSha256(snapshot.source_content);
+      if (recalculatedHash !== snapshot.source_sha256) {
+        return NextResponse.json(
+          {
+            success: false,
+            error: `Source integrity check failed for snapshot chunk ${snapshot.chunk_id}: content has been modified.`,
+          },
+          { status: 409 }
+        );
+      }
+    }
+
+    // Verify the combined source digest against the memo.
+    const recalculatedDigest = computeSourceDigest(
+      snapshots.map((s) => s.source_sha256)
+    );
     const memoDigest = quote.memo_expected.split(':').pop() || '';
     if (recalculatedDigest !== memoDigest) {
       return NextResponse.json(
@@ -205,64 +235,42 @@ export async function POST(req: Request) {
     const receipt = await verifySettlementTransaction(txSignature, quote, buyerWallet);
 
     // TASK 3, item 8: Validate source integrity again before AI generation.
-    // Re-fetch chunks and re-verify to prevent modification between integrity
-    // check and settlement. This is a defense-in-depth check.
-    const postSettlementChunksRes = await query<ChunkRecord>(
-      `SELECT
-         c.id, c.document_id, c.publisher_id, c.chunk_index, c.content, c.content_hash, c.token_count,
-         d.title as document_title, d.price_per_query_usdc,
-         p.wallet_address as publisher_wallet, p.name as publisher_name
-       FROM document_chunks c
-       JOIN documents d ON c.document_id = d.id
-       JOIN publishers p ON c.publisher_id = p.id
-       WHERE c.id = ANY($1::varchar[])
-       ORDER BY c.chunk_index ASC`,
-      [quote.matched_chunk_ids]
-    );
-
-    const postSettlementChunks = postSettlementChunksRes.rows;
-    if (postSettlementChunks.length !== quote.matched_chunk_ids.length) {
+    // Re-fetch snapshots and re-verify to prevent modification between integrity
+    // check and settlement. This is defense-in-depth (snapshots are immutable,
+    // so this is a belt-and-suspenders check).
+    const postSettlementSnapshots = await getQuoteSources(quote.id);
+    if (postSettlementSnapshots.length !== snapshots.length) {
       return NextResponse.json(
         {
           success: false,
           paymentSettled: true,
           error:
-            'Some purchased knowledge sources are no longer available after settlement. The receipt has been recorded; please contact support.',
+            'Source snapshot count changed after settlement. The receipt has been recorded; please contact support.',
         },
         { status: 409 }
       );
     }
+    const postSnapshotIntegrity = postSettlementSnapshots.map((s) => ({
+      content: s.source_content,
+      content_hash: s.source_sha256,
+      id: s.chunk_id,
+    }));
+    validateSnapshotIntegrity(postSnapshotIntegrity, quote.memo_expected);
 
-    for (const chunk of postSettlementChunks) {
-      const recalculatedHash = computeSha256(chunk.content);
-      if (recalculatedHash !== chunk.content_hash) {
-        return NextResponse.json(
-          {
-            success: false,
-            paymentSettled: true,
-            error: `Source integrity check failed for chunk ${chunk.id} after settlement: content has been modified.`,
-          },
-          { status: 409 }
-        );
-      }
-    }
-
-    const postSettlementDigest = computeSourceDigest(
-      postSettlementChunks.map((c) => c.content_hash)
-    );
-    if (postSettlementDigest !== memoDigest) {
-      return NextResponse.json(
-        {
-          success: false,
-          paymentSettled: true,
-          error: 'Source digest mismatch after settlement.',
-        },
-        { status: 409 }
-      );
-    }
-
-    // Use post-settlement chunks for AI generation.
-    const aiChunks = postSettlementChunks;
+    // Use snapshots for AI generation — never live chunks (TASK 3, item 10).
+    const aiChunks = postSettlementSnapshots.map((s) => ({
+      id: s.chunk_id,
+      document_id: s.document_id,
+      publisher_id: s.publisher_id,
+      publisher_wallet: s.publisher_wallet,
+      publisher_name: s.document_title,
+      document_title: s.document_title,
+      content: s.source_content,
+      content_hash: s.source_sha256,
+      price_per_query_usdc: s.document_price_base_units,
+      token_count: 0,
+      chunk_index: s.ordinal,
+    }));
 
     // 4. Grounded AI Generation (fails closed when no provider is reachable)
     let generated: {
@@ -310,18 +318,23 @@ export async function POST(req: Request) {
 }
 
 /**
- * TASK 3: Validate source integrity before AI generation.
- * Checks every chunk's SHA-256 hash and verifies the combined source digest
- * against the memo commitment.
+ * TASK 3: Validate source snapshot integrity before AI generation.
+ * Checks every snapshot's SHA-256 hash and verifies the combined source
+ * digest against the memo commitment. Snapshots are immutable, so this
+ * validates the exact content that was quoted.
  */
-function validateSourceIntegrity(
-  chunks: ChunkRecord[],
+function validateSnapshotIntegrity(
+  snapshots: Array<{
+    content: string;
+    content_hash: string;
+    id: string;
+  }>,
   memoExpected: string
 ): void {
   const memoDigest = memoExpected.split(':').pop() || '';
 
   // Recalculate each SHA-256 content hash and verify against stored hash.
-  for (const chunk of chunks) {
+  for (const chunk of snapshots) {
     const recalculatedHash = computeSha256(chunk.content);
     if (recalculatedHash !== chunk.content_hash) {
       throw new Error(
@@ -332,7 +345,7 @@ function validateSourceIntegrity(
 
   // Recalculate the combined source digest and verify against the memo.
   const recalculatedDigest = computeSourceDigest(
-    chunks.map((c) => c.content_hash)
+    snapshots.map((c) => c.content_hash)
   );
   if (recalculatedDigest !== memoDigest) {
     throw new Error(
@@ -349,37 +362,33 @@ async function generateAndRecord(
     memo_expected: string;
   },
   receiptId: string,
-  preloadedChunks?: ChunkRecord[]
+  preloadedChunks?: Array<{
+    id: string;
+    document_id: string;
+    publisher_id: string;
+    publisher_wallet: string;
+    publisher_name: string;
+    document_title: string;
+    content: string;
+    content_hash: string;
+    price_per_query_usdc: string;
+    token_count: number;
+    chunk_index: number;
+  }>
 ): Promise<{
   answer: string;
   citations: any;
   provider: string;
   model: string;
 }> {
-  let chunks = preloadedChunks;
-
-  if (!chunks) {
-    const chunksRes = await query<ChunkRecord>(
-      `SELECT
-         c.id, c.document_id, c.publisher_id, c.chunk_index, c.content, c.content_hash, c.token_count,
-         d.title as document_title, d.price_per_query_usdc,
-         p.wallet_address as publisher_wallet, p.name as publisher_name
-       FROM document_chunks c
-       JOIN documents d ON c.document_id = d.id
-       JOIN publishers p ON c.publisher_id = p.id
-       WHERE c.id = ANY($1::varchar[])
-       ORDER BY c.chunk_index ASC`,
-      [quote.matched_chunk_ids]
-    );
-    chunks = chunksRes.rows;
-  }
+  const chunks = preloadedChunks;
 
   if (!chunks || chunks.length !== quote.matched_chunk_ids.length) {
     throw new Error('The paid knowledge sources are no longer available.');
   }
 
   // TASK 3, item 8: Validate source integrity again before AI generation.
-  validateSourceIntegrity(chunks, quote.memo_expected);
+  validateSnapshotIntegrity(chunks, quote.memo_expected);
 
   const aiProvider = await getActiveAIProvider();
   const groundedResult = await aiProvider.generateAnswer(quote.query_text, chunks);

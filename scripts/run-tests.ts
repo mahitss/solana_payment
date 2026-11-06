@@ -14,11 +14,11 @@ import {
 import {
   buildMemoPayload,
   computeSourceDigest,
-  toBaseUnits,
   fromBaseUnits,
   formatUsdc,
+  parseNumericPrice,
 } from '../lib/protocol';
-import { createPaymentQuote, getQuote } from '../lib/quotes';
+import { createPaymentQuote, getQuote, getQuoteSources } from '../lib/quotes';
 import { verifySettlementTransaction, SolanaVerificationError } from '../lib/solana';
 import { buildGroundedPrompt, extractCitations } from '../lib/ai/provider';
 import { searchKnowledgeCollections } from '../lib/retrieval';
@@ -210,14 +210,14 @@ async function runSuite() {
   });
 
   await test('USDC money math is exact in integer base units', () => {
-    assert.strictEqual(toBaseUnits(0.05), 50_000);
-    assert.strictEqual(toBaseUnits(0.1), 100_000);
-    assert.strictEqual(fromBaseUnits(50_000), 0.05);
-    assert.strictEqual(formatUsdc(50_000), '0.050000');
+    assert.strictEqual(parseNumericPrice('0.05'), 50_000n);
+    assert.strictEqual(parseNumericPrice('0.1'), 100_000n);
+    assert.strictEqual(fromBaseUnits(50_000n), '0.050000');
+    assert.strictEqual(formatUsdc(50_000n), '0.050000');
 
     // Float arithmetic would drift here; integer base units must not.
-    const total = toBaseUnits(0.1) + toBaseUnits(0.2);
-    assert.strictEqual(total, 300_000, '0.1 + 0.2 must equal exactly 0.3 in base units');
+    const total = parseNumericPrice('0.1') + parseNumericPrice('0.2');
+    assert.strictEqual(total, 300_000n, '0.1 + 0.2 must equal exactly 0.3 in base units');
     assert.strictEqual(formatUsdc(total), '0.300000');
   });
 
@@ -361,10 +361,10 @@ async function runSuite() {
       );
       assert.strictEqual(
         quote.total_base_units,
-        100_000,
+        100_000n,
         'Total base units should be 100,000 (0.1 USDC)'
       );
-      assert.strictEqual(quote.total_price_usdc, 0.1, 'Total price should be 0.1 USDC');
+      assert.strictEqual(quote.total_price_usdc, '0.100000', 'Total price should be 0.1 USDC');
       assert(
         quote.memo_expected.startsWith(`CITERAIL:QUOTE:${quote.id}:${quote.quote_nonce}:`),
         `Memo must bind quote id and nonce, got ${quote.memo_expected}`
@@ -539,7 +539,7 @@ if (HAS_DB) {
     assert.strictEqual(quote.publisher_breakdown.length, 1, 'One publisher = one entry');
     assert.strictEqual(quote.publisher_breakdown[0]!.documents.length, 1, 'One document contribution');
     assert.strictEqual(quote.publisher_breakdown[0]!.documents[0]!.chunk_ids.length, 1, 'One chunk');
-    assert.strictEqual(quote.total_base_units, 50_000, '0.05 USDC = 50,000 base units');
+    assert.strictEqual(quote.total_base_units, 50_000n, '0.05 USDC = 50,000 base units');
   });
 
   // Test: One publisher, multiple documents — aggregated payment at single ATA.
@@ -576,10 +576,10 @@ if (HAS_DB) {
 
     assert.strictEqual(quote.publisher_breakdown.length, 1, 'One publisher wallet = one entry');
     assert.strictEqual(quote.publisher_breakdown[0]!.documents.length, 2, 'Two document contributions');
-    assert.strictEqual(quote.total_base_units, 125_000, '0.05 + 0.075 = 0.125 USDC = 125,000 base units');
+    assert.strictEqual(quote.total_base_units, 125_000n, '0.05 + 0.075 = 0.125 USDC = 125,000 base units');
     assert.strictEqual(
       quote.publisher_breakdown[0]!.amount_base_units,
-      125_000,
+      125_000n,
       'Aggregated amount matches sum of documents'
     );
   });
@@ -630,7 +630,7 @@ if (HAS_DB) {
     createdQuoteIds.push(quote.id);
 
     assert.strictEqual(quote.publisher_breakdown.length, 2, 'Two publishers = two entries');
-    assert.strictEqual(quote.total_base_units, 120_000, '0.05 + 0.03 + 0.04 = 0.12 USDC = 120,000 base units');
+    assert.strictEqual(quote.total_base_units, 120_000n, '0.05 + 0.03 + 0.04 = 0.12 USDC = 120,000 base units');
   });
 
   // Test: Modified chunk before payment — SHA-256 mismatch detected.
@@ -826,6 +826,232 @@ if (HAS_DB) {
     await query('DELETE FROM settlement_payouts WHERE receipt_id = $1', [receiptId]);
     await query('DELETE FROM settlement_receipts WHERE id = $1', [receiptId]);
     await query('DELETE FROM payment_quotes WHERE id = $1', [quoteId]);
+  });
+}
+
+// ------------------------------------------------------------------
+// TASK 5: Regression tests for Mission 002.2
+// Pure unit tests (no external dependencies)
+// ------------------------------------------------------------------
+
+// Test: parseNumericPrice accepts valid decimal strings.
+await test('parseNumericPrice: valid decimal strings', () => {
+  assert.strictEqual(parseNumericPrice('0.05'), 50_000n);
+  assert.strictEqual(parseNumericPrice('0.050000'), 50_000n);
+  assert.strictEqual(parseNumericPrice('1'), 1_000_000n);
+  assert.strictEqual(parseNumericPrice('1000'), 1_000_000_000n);
+  assert.strictEqual(parseNumericPrice('0.000001'), 1n);
+});
+
+// Test: parseNumericPrice rejects invalid inputs.
+await test('parseNumericPrice: invalid inputs rejected', () => {
+  assert.throws(() => parseNumericPrice(''), /empty/);
+  assert.throws(() => parseNumericPrice('abc'), /Invalid/);
+  assert.throws(() => parseNumericPrice('-0.05'), /positive/);
+  assert.throws(() => parseNumericPrice('0'), /at least/);
+  assert.throws(() => parseNumericPrice('0.0000001'), /decimal places/);
+  assert.throws(() => parseNumericPrice('1000.000001'), /maximum/);
+  assert.throws(() => parseNumericPrice('0.05.05'), /Invalid/);
+});
+
+// Test: formatUsdc produces exact fixed-decimal output.
+await test('formatUsdc: exact fixed-decimal formatting', () => {
+  assert.strictEqual(formatUsdc(50_000n), '0.050000');
+  assert.strictEqual(formatUsdc(1n), '0.000001');
+  assert.strictEqual(formatUsdc(1_000_000n), '1.000000');
+  assert.strictEqual(formatUsdc(1_234_567n), '1.234567');
+  assert.strictEqual(formatUsdc(0n), '0.000000');
+});
+
+// Test: fromBaseUnits produces exact decimal string.
+await test('fromBaseUnits: exact decimal string', () => {
+  assert.strictEqual(fromBaseUnits(50_000n), '0.050000');
+  assert.strictEqual(fromBaseUnits(1n), '0.000001');
+  assert.strictEqual(fromBaseUnits(1_000_000n), '1.000000');
+});
+
+// ------------------------------------------------------------------
+// Database-backed tests (DATABASE_URL required)
+// ------------------------------------------------------------------
+
+if (HAS_DB) {
+  // Test: createPaymentQuote with invalid price fails closed.
+  await test('createPaymentQuote: invalid price fails closed', async () => {
+    const badChunks: any[] = [
+      {
+        id: 'chk_badprice',
+        document_id: 'doc_badprice',
+        publisher_id: 'pub_badprice',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Bad Price',
+        document_title: 'Bad Price Doc',
+        price_per_query_usdc: 'invalid',
+        chunk_index: 0,
+        content: 'content',
+        content_hash: computeSha256('content'),
+        token_count: 5,
+      },
+    ];
+    let threw = false;
+    try {
+      await createPaymentQuote('bad price query', badChunks);
+    } catch (err: any) {
+      threw = true;
+      assert(err.message.includes('Invalid'), 'Should throw on invalid price');
+    }
+    assert(threw, 'Should throw on invalid price');
+  });
+
+  // Test: createPaymentQuote with zero price fails closed.
+  await test('createPaymentQuote: zero price fails closed', async () => {
+    const badChunks: any[] = [
+      {
+        id: 'chk_zero',
+        document_id: 'doc_zero',
+        publisher_id: 'pub_zero',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Zero Price',
+        document_title: 'Zero Price Doc',
+        price_per_query_usdc: '0',
+        chunk_index: 0,
+        content: 'content',
+        content_hash: computeSha256('content'),
+        token_count: 5,
+      },
+    ];
+    let threw = false;
+    try {
+      await createPaymentQuote('zero price query', badChunks);
+    } catch (err: any) {
+      threw = true;
+    }
+    assert(threw, 'Should throw on zero price');
+  });
+
+  // Test: createPaymentQuote with excessive price fails closed.
+  await test('createPaymentQuote: excessive price fails closed', async () => {
+    const badChunks: any[] = [
+      {
+        id: 'chk_excess',
+        document_id: 'doc_excess',
+        publisher_id: 'pub_excess',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Excess Price',
+        document_title: 'Excess Price Doc',
+        price_per_query_usdc: '2000',
+        chunk_index: 0,
+        content: 'content',
+        content_hash: computeSha256('content'),
+        token_count: 5,
+      },
+    ];
+    let threw = false;
+    try {
+      await createPaymentQuote('excess price query', badChunks);
+    } catch (err: any) {
+      threw = true;
+    }
+    assert(threw, 'Should throw on excessive price');
+  });
+
+  // Test: Price with more than 6 decimal places fails closed.
+  await test('createPaymentQuote: too many decimal places fails closed', async () => {
+    const badChunks: any[] = [
+      {
+        id: 'chk_decimals',
+        document_id: 'doc_decimals',
+        publisher_id: 'pub_decimals',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Decimal Price',
+        document_title: 'Decimal Price Doc',
+        price_per_query_usdc: '0.0500001',
+        chunk_index: 0,
+        content: 'content',
+        content_hash: computeSha256('content'),
+        token_count: 5,
+      },
+    ];
+    let threw = false;
+    try {
+      await createPaymentQuote('decimal price query', badChunks);
+    } catch (err: any) {
+      threw = true;
+    }
+    assert(threw, 'Should throw on too many decimal places');
+  });
+
+  // Test: getQuoteSources returns snapshots in ordinal order.
+  await test('getQuoteSources: returns snapshots in ordinal order', async () => {
+    // First create a quote (which creates snapshots atomically)
+    const quote = await createPaymentQuote('snapshot order query', [
+      {
+        id: 'chk_snap_1',
+        document_id: 'doc_snap_1',
+        publisher_id: 'pub_snap_1',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Snapshot Pub',
+        document_title: 'Snapshot Doc',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Snapshot content one',
+        content_hash: computeSha256('Snapshot content one'),
+        token_count: 5,
+      },
+      {
+        id: 'chk_snap_2',
+        document_id: 'doc_snap_2',
+        publisher_id: 'pub_snap_1',
+        publisher_wallet: VALID_ADDRESS,
+        publisher_name: 'Snapshot Pub',
+        document_title: 'Snapshot Doc 2',
+        price_per_query_usdc: '0.030000',
+        chunk_index: 1,
+        content: 'Snapshot content two',
+        content_hash: computeSha256('Snapshot content two'),
+        token_count: 5,
+      },
+    ]);
+    createdQuoteIds.push(quote.id);
+
+    const snapshots = await getQuoteSources(quote.id);
+    assert.strictEqual(snapshots.length, 2, 'Should have 2 snapshots');
+    assert.strictEqual(snapshots[0].ordinal, 0, 'First snapshot ordinal should be 0');
+    assert.strictEqual(snapshots[1].ordinal, 1, 'Second snapshot ordinal should be 1');
+    assert.strictEqual(snapshots[0].chunk_id, 'chk_snap_1');
+    assert.strictEqual(snapshots[1].chunk_id, 'chk_snap_2');
+
+    // Verify source_content is preserved (not exposed publicly but stored)
+    assert.strictEqual(snapshots[0].source_content, 'Snapshot content one');
+    assert.strictEqual(snapshots[1].source_content, 'Snapshot content two');
+
+    // Verify SHA-256 hashes match content.
+    assert.strictEqual(
+      snapshots[0].source_sha256,
+      computeSha256('Snapshot content one')
+    );
+    assert.strictEqual(
+      snapshots[1].source_sha256,
+      computeSha256('Snapshot content two')
+    );
+  });
+
+  // Test: Snapshot SHA-256 detects content modification.
+  await test('snapshot: SHA-256 detects content modification', async () => {
+    const original = 'Original content';
+    const modified = 'Modified content';
+    assert.notStrictEqual(
+      computeSha256(original),
+      computeSha256(modified),
+      'Modified content must produce different hash'
+    );
+  });
+
+  // Test: Source digest is order-independent.
+  await test('snapshot: source digest is order-independent', () => {
+    const hashes = ['aaa', 'bbb', 'ccc'];
+    const digest1 = computeSourceDigest(hashes);
+    const digest2 = computeSourceDigest([...hashes].reverse());
+    assert.strictEqual(digest1, digest2, 'Digest must be order-independent');
   });
 }
 

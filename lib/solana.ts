@@ -103,25 +103,6 @@ function collectInstructions(tx: ParsedTransactionWithMeta): Array<
   return all;
 }
 
-/** Computes the USDC balance delta for an owner between pre and post state. */
-function usdcBalanceDelta(
-  tx: ParsedTransactionWithMeta,
-  owner: string
-): bigint {
-  const mint = DEVNET_USDC_MINT.toBase58();
-  const pre = tx.meta?.preTokenBalances?.find(
-    (b) => b.owner === owner && b.mint === mint
-  );
-  const post = tx.meta?.postTokenBalances?.find(
-    (b) => b.owner === owner && b.mint === mint
-  );
-
-  const preAmt = BigInt(pre?.uiTokenAmount.amount || '0');
-  const postAmt = BigInt(post?.uiTokenAmount.amount || '0');
-
-  return postAmt - preAmt;
-}
-
 interface SplTransfer {
   destination: string;
   source: string;
@@ -169,10 +150,70 @@ function extractSplTransfers(
 }
 
 /**
- * Performs rigorous, server-side cryptographic and on-chain verification of a
- * buyer settlement transaction.
+ * Looks up the mint of a token account using pre/post token balance metadata.
  *
- * Every check fails closed: any doubt means the paid content is not released.
+ * Uses the accountIndex field on token balance entries, which maps to the
+ * transaction's accountKeys array. This is ground truth from the Solana
+ * runtime, unlike instruction-parsed mint data which is absent for unchecked
+ * `transfer` instructions.
+ *
+ * @returns The mint address, or null if the account is not a token account.
+ */
+function getTokenAccountMint(
+  tx: ParsedTransactionWithMeta,
+  accountAddress: string
+): string | null {
+  const allBalances = [
+    ...(tx.meta?.preTokenBalances ?? []),
+    ...(tx.meta?.postTokenBalances ?? []),
+  ];
+  const entry = allBalances.find(
+    (b) =>
+      b.accountIndex !== undefined &&
+      tx.transaction.message.accountKeys[b.accountIndex]?.pubkey.toBase58() ===
+        accountAddress
+  );
+  return entry?.mint ?? null;
+}
+
+/**
+ * Computes the USDC balance delta for a specific token account using pre/post
+ * token balance metadata.
+ *
+ * This is ground truth: the Solana runtime records the actual token balance
+ * before and after the transaction. Instruction-parsed amounts (especially for
+ * unchecked `transfer`) cannot be trusted for mint verification.
+ *
+ * @returns The post-minus-pre balance delta in base units, as BigInt.
+ */
+function getTokenAccountDelta(
+  tx: ParsedTransactionWithMeta,
+  accountAddress: string
+): bigint {
+  const usdcMintStr = DEVNET_USDC_MINT.toBase58();
+  const pre = tx.meta?.preTokenBalances?.find(
+    (b) =>
+      b.accountIndex !== undefined &&
+      b.mint === usdcMintStr &&
+      tx.transaction.message.accountKeys[b.accountIndex]?.pubkey.toBase58() ===
+        accountAddress
+  );
+  const post = tx.meta?.postTokenBalances?.find(
+    (b) =>
+      b.accountIndex !== undefined &&
+      b.mint === usdcMintStr &&
+      tx.transaction.message.accountKeys[b.accountIndex]?.pubkey.toBase58() ===
+        accountAddress
+  );
+  const preAmt = pre ? BigInt(pre.uiTokenAmount.amount) : BigInt(0);
+  const postAmt = post ? BigInt(post.uiTokenAmount.amount) : BigInt(0);
+  return postAmt - preAmt;
+}
+
+/**
+ * Removes the wallet-level balance fallback as an independent source of
+ * payment proof. All payment verification now uses per-token-account balance
+ * deltas from transaction metadata.
  */
 export async function verifySettlementTransaction(
   txSignature: string,
@@ -286,9 +327,19 @@ export async function verifySettlementTransaction(
   // 7. Verify Royalty Transfers to Publishers.
   //
   //    CiteRail settles exclusively in SPL USDC. Native SOL transfers are not
-  //    accepted: the old implementation compared lamports against USDC base
-  //    units, which made a transfer of 50,000 lamports count as a $0.05
-  //    payment.
+  //    accepted.
+  //
+  //    Every accepted transfer must:
+  //      - Originate from the buyer's USDC ATA (source)
+  //      - Go to a priced publisher's USDC ATA (destination)
+  //      - Have USDC as its mint (verified via token balance metadata, ground
+  //        truth from the Solana runtime)
+  //      - Match the exact expected amount per publisher (no underpayment,
+  //        no overpayment)
+  //
+  //    Instruction-parsed amounts are NOT trusted for unchecked `transfer`
+  //    instructions. Token balance deltas from pre/post metadata are the
+  //    authoritative source of truth.
   const payerKey = new PublicKey(feePayer);
   const payerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, payerKey);
   const payerAtaStr = payerAta.toBase58();
@@ -296,9 +347,7 @@ export async function verifySettlementTransaction(
 
   const splTransfers = extractSplTransfers(tx);
 
-  // Every USDC transfer in this transaction must originate from the buyer's
-  // authorized USDC token account and go to a publisher we priced. This
-  // prevents third-party funding and extra USDC outflows in the same tx.
+  // Build expected destinations: publisher ATA → publisher wallet.
   const expectedDestinations = new Map<string, string>();
   for (const pub of quote.publisher_breakdown) {
     const pubKey = new PublicKey(pub.publisher_wallet);
@@ -308,24 +357,60 @@ export async function verifySettlementTransaction(
     );
   }
 
-  // Validate every SPL transfer before crediting any publisher.
+  // Validate every SPL transfer: source must be buyer's ATA, destination must
+  // be a priced publisher's ATA, both accounts must be USDC token accounts.
+  // Third-party funding (transfer to a priced publisher from a non-buyer
+  // source) is explicitly rejected.
   for (const transfer of splTransfers) {
-    // Reject transfers that do not involve the configured USDC mint.
-    if (transfer.mint !== undefined && transfer.mint !== usdcMintStr) continue;
+    const destIsPriced = expectedDestinations.has(transfer.destination);
 
-    // B. Every accepted USDC payment must originate from the buyer's ATA.
-    if (transfer.source !== payerAtaStr) continue;
-
-    // E. Every USDC transfer must go to a priced publisher's ATA.
-    if (!expectedDestinations.has(transfer.destination)) {
+    // Reject third-party funding to a priced publisher's ATA.
+    if (destIsPriced && transfer.source !== payerAtaStr) {
       throw new SolanaVerificationError(
-        `Transaction contains an unexpected USDC transfer to ${transfer.destination}, which is not a publisher in quote ${quote.id}.`,
-        'UNEXPECTED_TRANSFER'
+        `Third-party funding detected: transfer to ${transfer.destination} from non-buyer source ${transfer.source}.`,
+        'THIRD_PARTY_FUNDING'
+      );
+    }
+
+    // Skip transfers that don't involve our pricing: wrong source or
+    // unpriced destination.
+    if (transfer.source !== payerAtaStr) continue;
+    if (!destIsPriced) continue;
+
+    // Verify source account mint is USDC via token balance metadata.
+    const sourceMint = getTokenAccountMint(tx, transfer.source);
+    if (sourceMint !== usdcMintStr) {
+      throw new SolanaVerificationError(
+        `Source account ${transfer.source} is not a USDC token account.`,
+        'WRONG_SOURCE_MINT'
+      );
+    }
+
+    // Verify destination account mint is USDC via token balance metadata.
+    const destMint = getTokenAccountMint(tx, transfer.destination);
+    if (destMint !== usdcMintStr) {
+      throw new SolanaVerificationError(
+        `Destination account ${transfer.destination} is not a USDC token account.`,
+        'WRONG_DESTINATION_MINT'
       );
     }
   }
 
-  let totalTransferredBaseUnits = 0n;
+  // Compute actual credited amounts from token balance deltas (ground truth),
+  // not instruction-parsed amounts.
+  const destinationDeltas = new Map<string, bigint>();
+  for (const transfer of splTransfers) {
+    if (transfer.source !== payerAtaStr) continue;
+    if (!expectedDestinations.has(transfer.destination)) continue;
+
+    const delta = getTokenAccountDelta(tx, transfer.destination);
+    if (delta > BigInt(0)) {
+      const existing = destinationDeltas.get(transfer.destination) ?? BigInt(0);
+      destinationDeltas.set(transfer.destination, existing + delta);
+    }
+  }
+
+  let totalTransferredBaseUnits = BigInt(0);
   const verifiedBreakdown: Array<{
     publisher_id: string;
     publisher_wallet: string;
@@ -337,57 +422,28 @@ export async function verifySettlementTransaction(
     verified: boolean;
   }> = [];
 
-  // Track which transfers have already been credited to prevent double counting
-  // when the same publisher appears under multiple documents (G) or duplicate
-  // transfer instructions exist in the transaction.
-  const creditedTransferIndices = new Set<number>();
-
   for (const pub of quote.publisher_breakdown) {
-    const pubWalletKey = new PublicKey(pub.publisher_wallet);
-    const expectedAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, pubWalletKey);
+    const expectedAta = getAssociatedTokenAddressSync(
+      DEVNET_USDC_MINT,
+      new PublicKey(pub.publisher_wallet)
+    );
     const expectedAtaStr = expectedAta.toBase58();
 
-    let amountReceivedForPub = 0n;
+    // Use token balance delta as the authoritative credited amount.
+    const amountReceivedForPub = destinationDeltas.get(expectedAtaStr) ?? BigInt(0);
 
-    for (let i = 0; i < splTransfers.length; i++) {
-      const transfer = splTransfers[i];
-
-      // Skip transfers already credited (prevents duplicate counting).
-      if (creditedTransferIndices.has(i)) continue;
-
-      // Must go to this publisher's ATA.
-      if (transfer.destination !== expectedAtaStr) continue;
-
-      // Mint must be USDC (proven via transferChecked or source ATA inference).
-      if (transfer.mint !== undefined && transfer.mint !== usdcMintStr) continue;
-
-      // Source must be the buyer's ATA (third-party funding rejected).
-      if (transfer.source !== payerAtaStr) continue;
-
-      const amount = transfer.amount;
-      if (amount <= 0n) continue;
-
-      amountReceivedForPub += amount;
-      creditedTransferIndices.add(i);
-    }
-
-    // Cross-check against the mint-filtered balance delta. This path is
-    // immune to mint confusion entirely and uses BigInt.
-    const balanceDelta = usdcBalanceDelta(tx, pub.publisher_wallet);
-    if (balanceDelta > amountReceivedForPub) {
-      amountReceivedForPub = balanceDelta;
-    }
-
+    // Enforce EXACT per-publisher amount: reject underpayment AND overpayment.
     const expectedAmount = BigInt(pub.amount_base_units);
-    if (amountReceivedForPub < expectedAmount) {
+    if (amountReceivedForPub !== expectedAmount) {
       throw new SolanaVerificationError(
-        `Insufficient ${SETTLEMENT_ASSET} received for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected ${expectedAmount} base units, received ${amountReceivedForPub} base units.`,
-        'INSUFFICIENT_TRANSFER'
+        `Incorrect ${SETTLEMENT_ASSET} amount for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected exactly ${expectedAmount} base units, received ${amountReceivedForPub} base units.`,
+        amountReceivedForPub < expectedAmount
+          ? 'INSUFFICIENT_TRANSFER'
+          : 'EXCESSIVE_TRANSFER'
       );
     }
 
     totalTransferredBaseUnits += amountReceivedForPub;
-    // Flatten all document IDs and titles from this publisher's contributions.
     const allDocumentIds = pub.documents.flatMap((d) => d.document_id);
     const allDocumentTitles = pub.documents.map((d) => d.document_title);
     verifiedBreakdown.push({
@@ -402,21 +458,24 @@ export async function verifySettlementTransaction(
     });
   }
 
-  // 8. Verify the payer was actually debited in USDC.
-  const payerDelta = usdcBalanceDelta(tx, feePayer);
-  const expectedPayerDebit = -BigInt(quote.total_base_units);
-  if (payerDelta > expectedPayerDebit) {
+  // 8. Verify EXACT total transferred: reject underpayment AND overpayment.
+  if (totalTransferredBaseUnits !== BigInt(quote.total_base_units)) {
     throw new SolanaVerificationError(
-      `Payer USDC balance decreased by ${Math.abs(Number(payerDelta))} base units, but the quote requires ${quote.total_base_units} base units.`,
-      'PAYER_NOT_DEBITED'
+      `Total settled amount ${totalTransferredBaseUnits} base units does not equal the quoted total ${quote.total_base_units} base units.`,
+      totalTransferredBaseUnits < BigInt(quote.total_base_units)
+        ? 'INSUFFICIENT_TOTAL'
+        : 'EXCESSIVE_TOTAL'
     );
   }
 
-  // 9. Verify the total paid covers the quote total (BigInt comparison).
-  if (totalTransferredBaseUnits < BigInt(quote.total_base_units)) {
+  // 9. Verify EXACT payer debit: the buyer's USDC ATA must be debited by
+  //    exactly the quote total (no more, no less).
+  const payerAtaDelta = getTokenAccountDelta(tx, payerAtaStr);
+  const expectedPayerDebit = -BigInt(quote.total_base_units);
+  if (payerAtaDelta !== expectedPayerDebit) {
     throw new SolanaVerificationError(
-      `Total settled amount ${totalTransferredBaseUnits} base units is below the quoted total ${quote.total_base_units} base units.`,
-      'INSUFFICIENT_TOTAL'
+      `Payer USDC ATA delta is ${payerAtaDelta} base units, but the quote requires exactly ${expectedPayerDebit} base units (debit of ${quote.total_base_units}).`,
+      'PAYER_NOT_DEBITED_EXACT'
     );
   }
 
@@ -479,7 +538,7 @@ export async function verifySettlementTransaction(
           item.publisher_name,
           item.document_ids,
           item.received_amount,
-          formatUsdc(Number(item.received_amount)),
+          formatUsdc(item.received_amount),
           SETTLEMENT_ASSET,
           cleanSig,
           new Date(blockTimeSec * 1000).toISOString(),

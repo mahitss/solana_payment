@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { query } from './db';
+import { query, withTransaction } from './db';
 import { ChunkRecord } from './documents';
 import { computeSha256 } from './chunker';
 import { config } from './config';
@@ -9,7 +9,9 @@ import {
   computeSourceDigest,
   formatUsdc,
   fromBaseUnits,
-  toBaseUnits,
+  MAX_PRICE_USDC,
+  parseNumericPrice,
+  USDC_BASE_UNIT,
 } from './protocol';
 
 export interface DocumentContribution {
@@ -17,9 +19,9 @@ export interface DocumentContribution {
   document_title: string;
   chunk_ids: string[];
   /** Price for this document, in USDC base units (6 dp). */
-  amount_base_units: number;
-  /** Price for this document, in whole USDC. */
-  amount_usdc: number;
+  amount_base_units: bigint;
+  /** Price for this document, as a fixed 6-decimal USDC string. */
+  amount_usdc: string;
 }
 
 export interface PublisherPaymentBreakdown {
@@ -28,10 +30,10 @@ export interface PublisherPaymentBreakdown {
   publisher_name: string;
   /** One contribution per distinct document from this publisher. */
   documents: DocumentContribution[];
-  /** Aggregated price across all documents from this publisher, in whole USDC. */
-  amount_usdc: number;
   /** Aggregated price across all documents from this publisher, in USDC base units (6 dp). */
-  amount_base_units: number;
+  amount_base_units: bigint;
+  /** Aggregated price across all documents from this publisher, as a fixed 6-decimal USDC string. */
+  amount_usdc: string;
 }
 
 export interface PaymentQuote {
@@ -40,8 +42,10 @@ export interface PaymentQuote {
   query_text: string;
   matched_chunk_ids: string[];
   publisher_breakdown: PublisherPaymentBreakdown[];
-  total_price_usdc: number;
-  total_base_units: number;
+  /** Total price as a fixed 6-decimal USDC string. */
+  total_price_usdc: string;
+  /** Total price in USDC base units (6 dp), as BigInt. */
+  total_base_units: bigint;
   memo_expected: string;
   buyer_wallet: string | null;
   expires_at: string;
@@ -72,13 +76,14 @@ export async function createPaymentQuote(
     let entry = breakdownMap.get(key);
 
     if (!entry) {
-      const price = Number.parseFloat(chunk.price_per_query_usdc);
-      if (!Number.isFinite(price) || price <= 0) {
+      const baseUnits = parseNumericPrice(chunk.price_per_query_usdc);
+      if (baseUnits > MAX_PRICE_USDC) {
         throw new Error(
-          `Invalid or missing price for document ${chunk.document_id} (chunk ${chunk.id}). Quotes fail closed on invalid pricing.`
+          `Price for document ${chunk.document_id} exceeds maximum of ${
+            MAX_PRICE_USDC / USDC_BASE_UNIT
+          } USDC.`
         );
       }
-      const baseUnits = toBaseUnits(price);
 
       entry = {
         publisher_id: chunk.publisher_id,
@@ -93,8 +98,8 @@ export async function createPaymentQuote(
             amount_usdc: fromBaseUnits(baseUnits),
           },
         ],
-        amount_usdc: fromBaseUnits(baseUnits),
         amount_base_units: baseUnits,
+        amount_usdc: fromBaseUnits(baseUnits),
       };
       breakdownMap.set(key, entry);
       continue;
@@ -103,13 +108,14 @@ export async function createPaymentQuote(
     // Find or create a document contribution within this publisher entry.
     const docContribution = entry.documents.find((d) => d.document_id === chunk.document_id);
     if (!docContribution) {
-      const price = Number.parseFloat(chunk.price_per_query_usdc);
-      if (!Number.isFinite(price) || price <= 0) {
+      const baseUnits = parseNumericPrice(chunk.price_per_query_usdc);
+      if (baseUnits > MAX_PRICE_USDC) {
         throw new Error(
-          `Invalid or missing price for document ${chunk.document_id} (chunk ${chunk.id}). Quotes fail closed on invalid pricing.`
+          `Price for document ${chunk.document_id} exceeds maximum of ${
+            MAX_PRICE_USDC / USDC_BASE_UNIT
+          } USDC.`
         );
       }
-      const baseUnits = toBaseUnits(price);
       entry.documents.push({
         document_id: chunk.document_id,
         document_title: chunk.document_title,
@@ -129,8 +135,8 @@ export async function createPaymentQuote(
   // All money is summed in integer base units so the total can never drift
   // from the sum of its parts.
   const totalBaseUnits = publisherBreakdown.reduce(
-    (sum, p) => sum + p.amount_base_units,
-    0
+    (sum: bigint, p) => sum + p.amount_base_units,
+    BigInt(0)
   );
   const totalPriceUsdc = fromBaseUnits(totalBaseUnits);
 
@@ -145,41 +151,80 @@ export async function createPaymentQuote(
 
   const expiresAt = new Date(Date.now() + expirySeconds * 1000).toISOString();
 
-  const insertSql = `
-    INSERT INTO payment_quotes (
-      id, quote_nonce, query_text, matched_chunk_ids, publisher_breakdown,
-      total_price_usdc, memo_expected, buyer_wallet, expires_at, status
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING')
-    RETURNING *;
-  `;
+  const quoteRow = await withTransaction(async (client) => {
+    const insertSql = `
+      INSERT INTO payment_quotes (
+        id, quote_nonce, query_text, matched_chunk_ids, publisher_breakdown,
+        total_price_usdc, memo_expected, buyer_wallet, expires_at, status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING')
+      RETURNING *;
+    `;
 
-  const res = await query(insertSql, [
-    quoteId,
-    quoteNonce,
-    queryText,
-    JSON.stringify(matchedChunks.map((c) => c.id)),
-    JSON.stringify(publisherBreakdown),
-    formatUsdc(totalBaseUnits),
-    memoExpected,
-    buyerWallet,
-    expiresAt,
-  ]);
+    const res = await client.query(insertSql, [
+      quoteId,
+      quoteNonce,
+      queryText,
+      JSON.stringify(matchedChunks.map((c) => c.id)),
+      JSON.stringify(
+        publisherBreakdown.map((p) => ({
+          ...p,
+          amount_base_units: p.amount_base_units.toString(),
+          documents: p.documents.map((d) => ({
+            ...d,
+            amount_base_units: d.amount_base_units.toString(),
+          })),
+        }))
+      ),
+      formatUsdc(totalBaseUnits),
+      memoExpected,
+      buyerWallet,
+      expiresAt,
+    ]);
 
-  const row = res.rows[0];
+    // Insert immutable source snapshots for every priced chunk.
+    // Snapshots are write-once: they capture the exact content that was quoted
+    // and are never exposed through public APIs.
+    const sourceInsertSql = `
+      INSERT INTO payment_quote_sources (
+        id, quote_id, ordinal, chunk_id, document_id, publisher_id,
+        publisher_wallet, document_title, source_content, source_sha256,
+        document_price_base_units
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    `;
+
+    let ordinal = 0;
+    for (const chunk of matchedChunks) {
+      await client.query(sourceInsertSql, [
+        `src_${crypto.randomUUID()}`,
+        quoteId,
+        ordinal++,
+        chunk.id,
+        chunk.document_id,
+        chunk.publisher_id,
+        chunk.publisher_wallet,
+        chunk.document_title,
+        chunk.content,
+        chunk.content_hash,
+        BigInt(parseNumericPrice(chunk.price_per_query_usdc)),
+      ]);
+    }
+
+    return res.rows[0];
+  });
 
   return {
-    id: row.id,
-    quote_nonce: row.quote_nonce,
-    query_text: row.query_text,
-    matched_chunk_ids: row.matched_chunk_ids,
+    id: quoteRow.id,
+    quote_nonce: quoteRow.quote_nonce,
+    query_text: quoteRow.query_text,
+    matched_chunk_ids: quoteRow.matched_chunk_ids,
     publisher_breakdown: publisherBreakdown,
     total_price_usdc: totalPriceUsdc,
     total_base_units: totalBaseUnits,
-    memo_expected: row.memo_expected,
-    buyer_wallet: row.buyer_wallet,
-    expires_at: row.expires_at,
-    status: row.status,
-    created_at: row.created_at,
+    memo_expected: quoteRow.memo_expected,
+    buyer_wallet: quoteRow.buyer_wallet,
+    expires_at: quoteRow.expires_at,
+    status: quoteRow.status,
+    created_at: quoteRow.created_at,
   };
 }
 
@@ -197,8 +242,8 @@ export async function getQuote(quoteId: string): Promise<PaymentQuote | null> {
   // trusting the stored decimal, so a corrupted or hand-edited row can never
   // cause an under-payment to slip through.
   const totalBaseUnits = (breakdown || []).reduce(
-    (sum: number, p: PublisherPaymentBreakdown) => sum + (p.amount_base_units || 0),
-    0
+    (sum: bigint, p) => sum + BigInt(p.amount_base_units),
+    BigInt(0)
   );
 
   return {
@@ -218,6 +263,34 @@ export async function getQuote(quoteId: string): Promise<PaymentQuote | null> {
     status: row.status,
     created_at: row.created_at,
   };
+}
+
+/**
+ * Fetches the immutable source snapshots for a quote, ordered by ordinal.
+ * Used during settlement to verify source integrity without touching mutable
+ * live chunks.
+ */
+export async function getQuoteSources(quoteId: string): Promise<Array<{
+  ordinal: number;
+  chunk_id: string;
+  document_id: string;
+  publisher_id: string;
+  publisher_wallet: string;
+  document_title: string;
+  source_content: string;
+  source_sha256: string;
+  document_price_base_units: string;
+}>> {
+  const res = await query(
+    `SELECT ordinal, chunk_id, document_id, publisher_id, publisher_wallet,
+            document_title, source_content, source_sha256,
+            document_price_base_units::text
+     FROM payment_quote_sources
+     WHERE quote_id = $1
+     ORDER BY ordinal ASC`,
+    [quoteId]
+  );
+  return res.rows;
 }
 
 /**
