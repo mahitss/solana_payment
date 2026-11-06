@@ -5,9 +5,13 @@ services:
     plan: starter
     buildCommand: npm install && npm run build
     startCommand: npm run start
+    # Secrets are injected via the Render dashboard as environment secrets and are
+    # never committed to this repository. Every entry below with `sync: false`
+    # must be supplied by the operator on first deploy.
     envVars:
+      # Neon (or any) Postgres connection string - set in the Render dashboard.
       - key: DATABASE_URL
-        value: postgresql://neondb_owner:npg_7sZlAS4TgzFC@ep-tiny-sea-bfvq66w1-pooler.c-5.us-west-2.aws.neon.tech/neondb?sslmode=require
+        sync: false
       - key: NEXT_PUBLIC_SOLANA_RPC_URL
         value: https://api.devnet.solana.com
       - key: NEXT_PUBLIC_SOLANA_NETWORK
@@ -16,7 +20,17 @@ services:
         value: 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
       - key: NEXT_PUBLIC_MEMO_PROGRAM_ID
         value: MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr
+      # Public, non-secret placeholder. A loopback address is useless on a
+      # hosted dyno, so point this at a reachable Ollama endpoint (Render private
+      # service, VPN or public host) from the dashboard if one is available.
       - key: OLLAMA_BASE_URL
-        value: http://127.0.0.1:11434
+        value: https://ollama.com
       - key: OLLAMA_MODEL
         value: gemma3:4b
+      # Gemini fallback provider key - set in the Render dashboard.
+      - key: GEMINI_API_KEY
+        sync: false
+      # Session token signing secret (`openssl rand -hex 32`) - set in the
+      # Render dashboard. Required in production.
+      - key: AUTH_SECRET
+        sync: false

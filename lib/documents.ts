@@ -1,7 +1,7 @@
-import { query, pool } from './db';
+import crypto from 'crypto';
+import { query, withTransaction } from './db';
 import { getOrCreatePublisher } from './publishers';
 import { chunkText, computeSha256, parseMarkdown, parsePdfBuffer } from './chunker';
-import crypto from 'crypto';
 
 export interface DocumentRecord {
   id: string;
@@ -32,6 +32,17 @@ export interface ChunkRecord {
   score?: number;
 }
 
+/** Minimum and maximum accepted per-query price, in whole USDC. */
+const MIN_PRICE_USDC = 0.000001;
+const MAX_PRICE_USDC = 1000;
+
+export class DuplicateDocumentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DuplicateDocumentError';
+  }
+}
+
 export async function ingestDocument(params: {
   publisherWallet: string;
   publisherName?: string;
@@ -51,7 +62,9 @@ export async function ingestDocument(params: {
     }
     extractedText = await parsePdfBuffer(params.rawBuffer);
   } else {
-    extractedText = parseMarkdown(params.rawText || (params.rawBuffer ? params.rawBuffer.toString('utf8') : ''));
+    extractedText = parseMarkdown(
+      params.rawText || (params.rawBuffer ? params.rawBuffer.toString('utf8') : '')
+    );
   }
 
   if (!extractedText.trim()) {
@@ -61,12 +74,41 @@ export async function ingestDocument(params: {
   const docId = `doc_${crypto.randomUUID()}`;
   const docHash = computeSha256(extractedText);
   const chunks = chunkText(extractedText);
-  const price = params.pricePerQueryUsdc !== undefined ? Math.max(0.000001, params.pricePerQueryUsdc) : 0.050000;
+
+  if (chunks.length === 0) {
+    throw new Error('Document produced no indexable chunks.');
+  }
+
+  const requestedPrice =
+    params.pricePerQueryUsdc !== undefined ? params.pricePerQueryUsdc : 0.05;
+
+  if (!Number.isFinite(requestedPrice) || requestedPrice <= 0) {
+    throw new Error('Price per query must be a positive number.');
+  }
+  if (requestedPrice < MIN_PRICE_USDC || requestedPrice > MAX_PRICE_USDC) {
+    throw new Error(
+      `Price per query must be between ${MIN_PRICE_USDC} and ${MAX_PRICE_USDC} USDC.`
+    );
+  }
+
+  const price = requestedPrice;
   const license = params.licenseType || 'query_royalty_v1';
 
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
+  return withTransaction(async (client) => {
+    // Reject byte-identical re-uploads by the same publisher. Without this a
+    // publisher can flood the corpus with copies of one document, diluting
+    // retrieval quality for every other publisher.
+    const duplicate = await client.query(
+      `SELECT id, title FROM documents
+       WHERE publisher_id = $1 AND content_hash = $2`,
+      [publisher.id, docHash]
+    );
+    if (duplicate.rows.length > 0) {
+      throw new DuplicateDocumentError(
+        `This document has already been published by this wallet as "${duplicate.rows[0].title}". ` +
+          'Each distinct document may only be published once.'
+      );
+    }
 
     const insertDocSql = `
       INSERT INTO documents (
@@ -105,8 +147,6 @@ export async function ingestDocument(params: {
       );
     }
 
-    await client.query('COMMIT');
-
     return {
       id: docId,
       publisher_id: publisher.id,
@@ -120,22 +160,18 @@ export async function ingestDocument(params: {
       total_chunks: chunks.length,
       created_at: docRes.rows[0].created_at,
     };
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
+  });
 }
 
-export async function listAllDocuments(): Promise<DocumentRecord[]> {
+export async function listAllDocuments(limit = 100): Promise<DocumentRecord[]> {
   const sql = `
     SELECT d.*, p.wallet_address as publisher_wallet, p.name as publisher_name
     FROM documents d
     JOIN publishers p ON d.publisher_id = p.id
     ORDER BY d.created_at DESC
+    LIMIT $1;
   `;
-  const res = await query(sql);
+  const res = await query(sql, [limit]);
   return res.rows;
 }
 
@@ -148,4 +184,18 @@ export async function getDocumentById(id: string): Promise<DocumentRecord | null
   `;
   const res = await query(sql, [id]);
   return res.rows[0] || null;
+}
+
+export async function listDocumentsByPublisher(
+  publisherId: string
+): Promise<DocumentRecord[]> {
+  const sql = `
+    SELECT d.*, p.wallet_address as publisher_wallet, p.name as publisher_name
+    FROM documents d
+    JOIN publishers p ON d.publisher_id = p.id
+    WHERE d.publisher_id = $1
+    ORDER BY d.created_at DESC
+  `;
+  const res = await query(sql, [publisherId]);
+  return res.rows;
 }

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    name: Typecheck, lint and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Placeholder values so the build never depends on real infrastructure.
+      # Integration tests that require a live Postgres + Ollama run separately.
+      DATABASE_URL: postgresql://user:pass@localhost:5432/citerail
+      AUTH_SECRET: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npx next lint
+
+      - name: Build
+        run: npx next build

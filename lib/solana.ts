@@ -5,17 +5,20 @@ import {
   PartiallyDecodedInstruction,
   ParsedInstruction,
 } from '@solana/web3.js';
-import { getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID } from '@solana/spl-token';
-import { query, pool } from './db';
+import { getAssociatedTokenAddressSync } from '@solana/spl-token';
+import { withTransaction } from './db';
 import { PaymentQuote } from './quotes';
+import { config } from './config';
+import {
+  SETTLEMENT_ASSET,
+  USDC_BASE_UNIT,
+  formatUsdc,
+  fromBaseUnits,
+} from './protocol';
 
-export const DEVNET_RPC_URL = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || 'https://api.devnet.solana.com';
-export const DEVNET_USDC_MINT = new PublicKey(
-  process.env.NEXT_PUBLIC_USDC_MINT || '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'
-);
-export const MEMO_PROGRAM_ID = new PublicKey(
-  process.env.NEXT_PUBLIC_MEMO_PROGRAM_ID || 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
-);
+export const DEVNET_RPC_URL = config.solanaRpcUrl;
+export const DEVNET_USDC_MINT = new PublicKey(config.usdcMint);
+export const MEMO_PROGRAM_ID = new PublicKey(config.memoProgramId);
 
 export interface ReceiptRecord {
   id: string;
@@ -23,6 +26,8 @@ export interface ReceiptRecord {
   tx_signature: string;
   payer_wallet: string;
   total_amount_usdc: number;
+  total_base_units: number;
+  settlement_asset: string;
   solana_slot: number;
   block_time: string;
   memo_verified: boolean;
@@ -87,9 +92,91 @@ function extractMemoFromParsedTx(tx: ParsedTransactionWithMeta): string | null {
   return null;
 }
 
+/** Collects every parsed instruction in a transaction, including inner ones. */
+function collectInstructions(tx: ParsedTransactionWithMeta): Array<
+  ParsedInstruction | PartiallyDecodedInstruction
+> {
+  const all: Array<ParsedInstruction | PartiallyDecodedInstruction> = [
+    ...tx.transaction.message.instructions,
+  ];
+  if (tx.meta?.innerInstructions) {
+    for (const inner of tx.meta.innerInstructions) {
+      all.push(...inner.instructions);
+    }
+  }
+  return all;
+}
+
+/** Computes the USDC balance delta for an owner between pre and post state. */
+function usdcBalanceDelta(
+  tx: ParsedTransactionWithMeta,
+  owner: string
+): number {
+  const mint = DEVNET_USDC_MINT.toBase58();
+  const pre = tx.meta?.preTokenBalances?.find(
+    (b) => b.owner === owner && b.mint === mint
+  );
+  const post = tx.meta?.postTokenBalances?.find(
+    (b) => b.owner === owner && b.mint === mint
+  );
+
+  const preAmt = Number.parseInt(pre?.uiTokenAmount.amount || '0', 10);
+  const postAmt = Number.parseInt(post?.uiTokenAmount.amount || '0', 10);
+
+  return postAmt - preAmt;
+}
+
+interface SplTransfer {
+  destination: string;
+  source: string;
+  amount: number;
+  /** Mint when the instruction discloses it (transferChecked). */
+  mint?: string;
+}
+
 /**
- * Performs rigorous, server-side cryptographic and on-chain verification
- * of a buyer settlement transaction.
+ * Extracts every SPL token transfer in the transaction.
+ *
+ * `transferChecked` discloses its mint directly. An unchecked `transfer` does
+ * not, so the caller must infer the token from the source ATA.
+ */
+function extractSplTransfers(
+  tx: ParsedTransactionWithMeta
+): SplTransfer[] {
+  const transfers: SplTransfer[] = [];
+
+  for (const ix of collectInstructions(tx)) {
+    if (!('parsed' in ix) || !ix.parsed) continue;
+    if (ix.program !== 'spl-token') continue;
+
+    const type = ix.parsed.type;
+    if (type !== 'transfer' && type !== 'transferChecked') continue;
+
+    const info = ix.parsed.info as any;
+    if (!info) continue;
+
+    const amount = info.tokenAmount
+      ? Number.parseInt(info.tokenAmount.amount, 10)
+      : Number.parseInt(info.amount, 10);
+
+    if (!Number.isFinite(amount)) continue;
+
+    transfers.push({
+      destination: String(info.destination ?? ''),
+      source: String(info.source ?? ''),
+      amount,
+      mint: info.mint ? String(info.mint) : undefined,
+    });
+  }
+
+  return transfers;
+}
+
+/**
+ * Performs rigorous, server-side cryptographic and on-chain verification of a
+ * buyer settlement transaction.
+ *
+ * Every check fails closed: any doubt means the paid content is not released.
  */
 export async function verifySettlementTransaction(
   txSignature: string,
@@ -97,20 +184,26 @@ export async function verifySettlementTransaction(
   expectedPayer?: string
 ): Promise<ReceiptRecord> {
   const cleanSig = txSignature.trim();
-  if (!cleanSig || cleanSig.length < 60) {
+  if (!cleanSig || cleanSig.length < 60 || cleanSig.length > 100) {
     throw new SolanaVerificationError('Invalid transaction signature format.', 'INVALID_SIGNATURE');
   }
 
   // 1. Check for Replay Attack in Database
-  const replayCheck = await query('SELECT * FROM settlement_receipts WHERE tx_signature = $1', [cleanSig]);
-  if (replayCheck.rows.length > 0) {
+  const replayCheck = await withTransaction(async (client) => {
+    const res = await client.query(
+      'SELECT id FROM settlement_receipts WHERE tx_signature = $1',
+      [cleanSig]
+    );
+    return res.rows;
+  });
+  if (replayCheck.length > 0) {
     throw new SolanaVerificationError(
       `Transaction signature ${cleanSig} has already been redeemed. Replay attacks are rejected.`,
       'REPLAY_DETECTED'
     );
   }
 
-  // 2. Fetch confirmed transaction from Solana Devnet RPC
+  // 2. Fetch confirmed transaction from Solana RPC
   const connection = getSolanaConnection();
   const tx = await connection.getParsedTransaction(cleanSig, {
     commitment: 'confirmed',
@@ -119,7 +212,7 @@ export async function verifySettlementTransaction(
 
   if (!tx) {
     throw new SolanaVerificationError(
-      `Transaction ${cleanSig} was not found on Solana Devnet. Ensure it has been confirmed.`,
+      `Transaction ${cleanSig} was not found on Solana ${config.solanaNetwork}. Ensure it has been confirmed.`,
       'TRANSACTION_NOT_FOUND'
     );
   }
@@ -148,27 +241,85 @@ export async function verifySettlementTransaction(
 
   // 5. Verify Signer / Payer
   const feePayer = tx.transaction.message.accountKeys[0]?.pubkey.toBase58();
-  if (expectedPayer && feePayer !== expectedPayer) {
+  if (!feePayer) {
+    throw new SolanaVerificationError(
+      'Could not determine the transaction fee payer.',
+      'PAYER_MISSING'
+    );
+  }
+  if (expectedPayer && feePayer !== expectedPayer.trim()) {
     throw new SolanaVerificationError(
       `Transaction payer mismatch. Expected: ${expectedPayer}, got: ${feePayer}`,
       'PAYER_MISMATCH'
     );
   }
 
-  // 6. Verify Memo instruction matching quote.memo_expected
+  // 6. Verify Memo instruction matches quote.memo_expected exactly.
+  //    A substring match would let a buyer append arbitrary data to the memo,
+  //    which breaks the "exact digest match" guarantee the protocol promises.
   const memoText = extractMemoFromParsedTx(tx);
-  if (!memoText || !memoText.includes(quote.memo_expected)) {
+  if (!memoText) {
     throw new SolanaVerificationError(
-      `Transaction memo verification failed. Expected memo containing "${quote.memo_expected}", got: "${memoText || 'none'}"`,
+      'Transaction does not contain a CiteRail memo instruction.',
+      'MEMO_MISSING'
+    );
+  }
+  if (memoText !== quote.memo_expected) {
+    throw new SolanaVerificationError(
+      `Transaction memo verification failed. Expected exactly "${quote.memo_expected}", got: "${memoText}"`,
       'MEMO_MISMATCH'
     );
   }
 
-  // 7. Verify Royalty Transfers to Publishers
-  // Check either SPL Token transfer (USDC) or Native SOL transfer fallback
+  // 7. Verify Royalty Transfers to Publishers.
+  //
+  //    CiteRail settles exclusively in SPL USDC. Native SOL transfers are not
+  //    accepted: the old implementation compared lamports against USDC base
+  //    units, which made a transfer of 50,000 lamports count as a $0.05
+  //    payment.
+  const payerKey = new PublicKey(feePayer);
+  const payerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, payerKey);
+  const payerAtaStr = payerAta.toBase58();
+  const usdcMintStr = DEVNET_USDC_MINT.toBase58();
+
+  const splTransfers = extractSplTransfers(tx);
+
+  // Every USDC transfer in this transaction must go to a publisher we priced.
+  // This prevents a buyer from bundling extra USDC outflows into the same
+  // atomic transaction.
+  const expectedDestinations = new Map<string, string>();
+  for (const pub of quote.publisher_breakdown) {
+    const pubKey = new PublicKey(pub.publisher_wallet);
+    expectedDestinations.set(
+      getAssociatedTokenAddressSync(DEVNET_USDC_MINT, pubKey).toBase58(),
+      pub.publisher_wallet
+    );
+  }
+
+  for (const transfer of splTransfers) {
+    // Determine whether this transfer is a USDC transfer.
+    const isUsdc =
+      transfer.mint !== undefined
+        ? transfer.mint === usdcMintStr
+        : transfer.source === payerAtaStr;
+
+    if (!isUsdc) continue;
+
+    if (!expectedDestinations.has(transfer.destination)) {
+      throw new SolanaVerificationError(
+        `Transaction contains an unexpected USDC transfer to ${transfer.destination}, which is not a publisher in quote ${quote.id}.`,
+        'UNEXPECTED_TRANSFER'
+      );
+    }
+  }
+
   let totalTransferredBaseUnits = 0;
   const verifiedBreakdown: Array<{
+    publisher_id: string;
     publisher_wallet: string;
+    publisher_name: string;
+    document_id: string;
+    document_title: string;
     expected_amount: number;
     received_amount: number;
     verified: boolean;
@@ -177,103 +328,88 @@ export async function verifySettlementTransaction(
   for (const pub of quote.publisher_breakdown) {
     const pubWalletKey = new PublicKey(pub.publisher_wallet);
     const expectedAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, pubWalletKey);
+    const expectedAtaStr = expectedAta.toBase58();
 
     let amountReceivedForPub = 0;
 
-    // Scan parsed instructions
-    const allInstructions: (ParsedInstruction | PartiallyDecodedInstruction)[] = [
-      ...tx.transaction.message.instructions,
-    ];
-    if (tx.meta?.innerInstructions) {
-      for (const inner of tx.meta.innerInstructions) {
-        allInstructions.push(...inner.instructions);
+    for (const transfer of splTransfers) {
+      const destIsAta = transfer.destination === expectedAtaStr;
+      const destIsWallet = transfer.destination === pub.publisher_wallet;
+
+      if (!destIsAta && !destIsWallet) continue;
+
+      // A transfer into the publisher's USDC ATA is necessarily USDC.
+      // A transfer into the bare wallet could be any SPL token, so the mint
+      // must be proven. For an unchecked `transfer` the mint is implied by the
+      // source ATA, which must therefore be the payer's USDC ATA.
+      if (destIsAta) {
+        if (transfer.mint !== undefined && transfer.mint !== usdcMintStr) continue;
+        amountReceivedForPub += transfer.amount;
+        continue;
+      }
+
+      if (transfer.mint === usdcMintStr) {
+        amountReceivedForPub += transfer.amount;
+      } else if (transfer.mint === undefined && transfer.source === payerAtaStr) {
+        amountReceivedForPub += transfer.amount;
       }
     }
 
-    for (const ix of allInstructions) {
-      if ('parsed' in ix && ix.parsed) {
-        const type = ix.parsed.type;
-        const info = ix.parsed.info;
-
-        // SPL Token transfer (USDC)
-        if (
-          ix.program === 'spl-token' &&
-          (type === 'transfer' || type === 'transferChecked') &&
-          info
-        ) {
-          const dest = info.destination;
-          const transferAmount = info.tokenAmount
-            ? parseInt(info.tokenAmount.amount, 10)
-            : parseInt(info.amount, 10);
-
-          if (
-            dest === expectedAta.toBase58() ||
-            dest === pub.publisher_wallet
-          ) {
-            amountReceivedForPub += transferAmount;
-          }
-        }
-
-        // Native SOL transfer support (SystemProgram transfer)
-        if (
-          ix.program === 'system' &&
-          type === 'transfer' &&
-          info &&
-          info.destination === pub.publisher_wallet
-        ) {
-          // Native SOL lamports
-          amountReceivedForPub += parseInt(info.lamports, 10);
-        }
-      }
+    // Cross-check against the mint-filtered balance delta. This path is
+    // immune to mint confusion entirely.
+    const balanceDelta = usdcBalanceDelta(tx, pub.publisher_wallet);
+    if (balanceDelta > amountReceivedForPub) {
+      amountReceivedForPub = balanceDelta;
     }
 
-    // Verify amount received meets minimum expected
     if (amountReceivedForPub < pub.amount_base_units) {
-      // Also check postTokenBalances / preTokenBalances delta for the recipient ATA
-      let balanceDelta = 0;
-      if (tx.meta?.postTokenBalances && tx.meta?.preTokenBalances) {
-        const post = tx.meta.postTokenBalances.find(
-          (b) => b.owner === pub.publisher_wallet && b.mint === DEVNET_USDC_MINT.toBase58()
-        );
-        const pre = tx.meta.preTokenBalances.find(
-          (b) => b.owner === pub.publisher_wallet && b.mint === DEVNET_USDC_MINT.toBase58()
-        );
-        const postAmt = parseInt(post?.uiTokenAmount.amount || '0', 10);
-        const preAmt = parseInt(pre?.uiTokenAmount.amount || '0', 10);
-        balanceDelta = Math.max(0, postAmt - preAmt);
-      }
-
-      if (balanceDelta >= pub.amount_base_units) {
-        amountReceivedForPub = balanceDelta;
-      } else {
-        throw new SolanaVerificationError(
-          `Insufficient payment received for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected ${pub.amount_base_units} units, received ${amountReceivedForPub} units.`,
-          'INSUFFICIENT_TRANSFER'
-        );
-      }
+      throw new SolanaVerificationError(
+        `Insufficient ${SETTLEMENT_ASSET} received for publisher ${pub.publisher_name} (${pub.publisher_wallet}). Expected ${pub.amount_base_units} base units, received ${amountReceivedForPub} base units.`,
+        'INSUFFICIENT_TRANSFER'
+      );
     }
 
     totalTransferredBaseUnits += amountReceivedForPub;
     verifiedBreakdown.push({
+      publisher_id: pub.publisher_id,
       publisher_wallet: pub.publisher_wallet,
+      publisher_name: pub.publisher_name,
+      document_id: pub.document_id,
+      document_title: pub.document_title,
       expected_amount: pub.amount_base_units,
       received_amount: amountReceivedForPub,
       verified: true,
     });
   }
 
-  // 8. Atomic Persistence: Record Receipt & Mark Quote Redeemed
-  const client = await pool.connect();
+  // 8. Verify the payer was actually debited in USDC.
+  const payerDelta = usdcBalanceDelta(tx, feePayer);
+  if (payerDelta > -quote.total_base_units) {
+    throw new SolanaVerificationError(
+      `Payer USDC balance decreased by ${Math.abs(payerDelta)} base units, but the quote requires ${quote.total_base_units} base units.`,
+      'PAYER_NOT_DEBITED'
+    );
+  }
+
+  // 9. Verify the total paid covers the quote total.
+  if (totalTransferredBaseUnits < quote.total_base_units) {
+    throw new SolanaVerificationError(
+      `Total settled amount ${totalTransferredBaseUnits} base units is below the quoted total ${quote.total_base_units} base units.`,
+      'INSUFFICIENT_TOTAL'
+    );
+  }
+
+  // 10. Atomic persistence: receipt, quote redemption and the normalised
+  //     payout ledger are written in a single transaction.
   const receiptId = `rcpt_${txSignature.slice(0, 16)}`;
 
-  try {
-    await client.query('BEGIN');
-
+  const receipt = await withTransaction(async (client) => {
     const insertReceiptSql = `
       INSERT INTO settlement_receipts (
         id, quote_id, tx_signature, payer_wallet, total_amount_usdc,
+        settlement_asset, settlement_amount_base_units,
         solana_slot, block_time, memo_verified, breakdown
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10)
       RETURNING *;
     `;
 
@@ -281,37 +417,77 @@ export async function verifySettlementTransaction(
       receiptId,
       quote.id,
       cleanSig,
-      feePayer || 'unknown',
-      quote.total_price_usdc,
+      feePayer,
+      formatUsdc(quote.total_base_units),
+      SETTLEMENT_ASSET,
+      quote.total_base_units,
       tx.slot,
       new Date(blockTimeSec * 1000).toISOString(),
       JSON.stringify(verifiedBreakdown),
     ]);
 
-    await client.query(
-      `UPDATE payment_quotes SET status = 'REDEEMED' WHERE id = $1`,
+    // Mark the quote redeemed. The conditional UPDATE means two concurrent
+    // redemptions of the same quote cannot both succeed.
+    const redeem = await client.query(
+      `UPDATE payment_quotes SET status = 'REDEEMED'
+       WHERE id = $1 AND status = 'PENDING' RETURNING id`,
       [quote.id]
     );
+    if (redeem.rows.length === 0) {
+      throw new SolanaVerificationError(
+        `Quote ${quote.id} is no longer redeemable.`,
+        'QUOTE_NOT_REDEEMABLE'
+      );
+    }
 
-    await client.query('COMMIT');
+    // Normalised payout ledger: one row per publisher per receipt, indexed so
+    // per-publisher royalty accounting is a query rather than a table scan.
+    for (const item of verifiedBreakdown) {
+      await client.query(
+        `INSERT INTO settlement_payouts (
+           id, receipt_id, quote_id, publisher_id, publisher_wallet, publisher_name,
+           amount_base_units, amount_usdc, asset, tx_signature, block_time
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (receipt_id, publisher_wallet) DO NOTHING`,
+        [
+          `pay_${cryptoRandomId()}`,
+          receiptId,
+          quote.id,
+          item.publisher_id,
+          item.publisher_wallet,
+          item.publisher_name,
+          item.received_amount,
+          formatUsdc(item.received_amount),
+          SETTLEMENT_ASSET,
+          cleanSig,
+          new Date(blockTimeSec * 1000).toISOString(),
+        ]
+      );
+    }
 
-    const r = receiptRes.rows[0];
-    return {
-      id: r.id,
-      quote_id: r.quote_id,
-      tx_signature: r.tx_signature,
-      payer_wallet: r.payer_wallet,
-      total_amount_usdc: parseFloat(r.total_amount_usdc),
-      solana_slot: Number(r.solana_slot),
-      block_time: r.block_time,
-      memo_verified: r.memo_verified,
-      breakdown: verifiedBreakdown,
-      created_at: r.created_at,
-    };
-  } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
-  } finally {
-    client.release();
-  }
+    return receiptRes.rows[0];
+  });
+
+  return {
+    id: receipt.id,
+    quote_id: receipt.quote_id,
+    tx_signature: receipt.tx_signature,
+    payer_wallet: receipt.payer_wallet,
+    total_amount_usdc: parseFloat(receipt.total_amount_usdc),
+    total_base_units: Number(receipt.settlement_amount_base_units),
+    settlement_asset: receipt.settlement_asset,
+    solana_slot: Number(receipt.solana_slot),
+    block_time: receipt.block_time,
+    memo_verified: receipt.memo_verified,
+    breakdown: verifiedBreakdown,
+    created_at: receipt.created_at,
+  };
 }
+
+function cryptoRandomId(): string {
+  // Imported lazily to keep the module's import surface small.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  return require('crypto').randomUUID();
+}
+
+export { USDC_BASE_UNIT, fromBaseUnits };

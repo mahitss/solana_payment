@@ -1,16 +1,28 @@
+import crypto from 'crypto';
 import { query } from './db';
 import { ChunkRecord } from './documents';
 import { computeSha256 } from './chunker';
-import crypto from 'crypto';
+import { config } from './config';
+import {
+  SETTLEMENT_ASSET,
+  buildMemoPayload,
+  computeSourceDigest,
+  formatUsdc,
+  fromBaseUnits,
+  toBaseUnits,
+} from './protocol';
 
 export interface PublisherPaymentBreakdown {
   publisher_id: string;
   publisher_wallet: string;
   publisher_name: string;
+  document_id: string;
   document_title: string;
   chunk_ids: string[];
+  /** Price charged for this publisher/document, in whole USDC. */
   amount_usdc: number;
-  amount_base_units: number; // 6 decimals for USDC
+  /** Price charged for this publisher/document, in USDC base units (6 dp). */
+  amount_base_units: number;
 }
 
 export interface PaymentQuote {
@@ -30,7 +42,7 @@ export interface PaymentQuote {
 export async function createPaymentQuote(
   queryText: string,
   matchedChunks: ChunkRecord[],
-  expirySeconds: number = 300
+  expirySeconds: number = config.quoteExpirySeconds
 ): Promise<PaymentQuote> {
   if (matchedChunks.length === 0) {
     throw new Error('Cannot create quote with zero matched chunks.');
@@ -39,36 +51,52 @@ export async function createPaymentQuote(
   const quoteId = `q_${crypto.randomUUID()}`;
   const quoteNonce = crypto.randomBytes(16).toString('hex');
 
-  // Group chunks by publisher
+  // Group by publisher AND document. A publisher who contributes chunks from
+  // two different licensed documents is paid for both - the price is a
+  // "price per query per document", not per publisher.
   const breakdownMap = new Map<string, PublisherPaymentBreakdown>();
   for (const chunk of matchedChunks) {
-    let entry = breakdownMap.get(chunk.publisher_id);
+    const key = `${chunk.publisher_id}:${chunk.document_id}`;
+    let entry = breakdownMap.get(key);
+
     if (!entry) {
-      const price = parseFloat(chunk.price_per_query_usdc) || 0.05;
+      const price = Number.parseFloat(chunk.price_per_query_usdc);
+      const baseUnits = toBaseUnits(Number.isFinite(price) ? price : 0.05);
+
       entry = {
         publisher_id: chunk.publisher_id,
         publisher_wallet: chunk.publisher_wallet,
         publisher_name: chunk.publisher_name,
+        document_id: chunk.document_id,
         document_title: chunk.document_title,
         chunk_ids: [],
-        amount_usdc: price,
-        amount_base_units: Math.round(price * 1_000_000),
+        amount_usdc: fromBaseUnits(baseUnits),
+        amount_base_units: baseUnits,
       };
-      breakdownMap.set(chunk.publisher_id, entry);
+      breakdownMap.set(key, entry);
     }
+
     entry.chunk_ids.push(chunk.id);
   }
 
   const publisherBreakdown = Array.from(breakdownMap.values());
-  const totalPriceUsdc = publisherBreakdown.reduce((sum, p) => sum + p.amount_usdc, 0);
-  const totalBaseUnits = Math.round(totalPriceUsdc * 1_000_000);
 
-  // Compute Merkle / concatenated hash of the source chunks
-  const chunkHashesConcat = matchedChunks.map((c) => c.content_hash).join(':');
-  const sourceDigest = computeSha256(chunkHashesConcat).slice(0, 16);
+  // All money is summed in integer base units so the total can never drift
+  // from the sum of its parts.
+  const totalBaseUnits = publisherBreakdown.reduce(
+    (sum, p) => sum + p.amount_base_units,
+    0
+  );
+  const totalPriceUsdc = fromBaseUnits(totalBaseUnits);
 
-  // Strict Memo formatting: CITERAIL:QUOTE:<quote_id>:<sourceDigest>
-  const memoExpected = `CITERAIL:${quoteId}:${sourceDigest}`;
+  // Digest over the exact chunk hashes that were priced.
+  const sourceDigest = computeSourceDigest(matchedChunks.map((c) => c.content_hash));
+
+  const memoExpected = buildMemoPayload({
+    quoteId,
+    quoteNonce,
+    sourceDigest,
+  });
 
   const expiresAt = new Date(Date.now() + expirySeconds * 1000).toISOString();
 
@@ -86,7 +114,7 @@ export async function createPaymentQuote(
     queryText,
     JSON.stringify(matchedChunks.map((c) => c.id)),
     JSON.stringify(publisherBreakdown),
-    totalPriceUsdc.toFixed(6),
+    formatUsdc(totalBaseUnits),
     memoExpected,
     expiresAt,
   ]);
@@ -99,7 +127,7 @@ export async function createPaymentQuote(
     query_text: row.query_text,
     matched_chunk_ids: row.matched_chunk_ids,
     publisher_breakdown: publisherBreakdown,
-    total_price_usdc: parseFloat(row.total_price_usdc),
+    total_price_usdc: totalPriceUsdc,
     total_base_units: totalBaseUnits,
     memo_expected: row.memo_expected,
     expires_at: row.expires_at,
@@ -113,23 +141,48 @@ export async function getQuote(quoteId: string): Promise<PaymentQuote | null> {
   if (res.rows.length === 0) return null;
   const row = res.rows[0];
 
-  const breakdown: PublisherPaymentBreakdown[] = typeof row.publisher_breakdown === 'string'
-    ? JSON.parse(row.publisher_breakdown)
-    : row.publisher_breakdown;
+  const breakdown: PublisherPaymentBreakdown[] =
+    typeof row.publisher_breakdown === 'string'
+      ? JSON.parse(row.publisher_breakdown)
+      : row.publisher_breakdown;
 
-  const totalUsdc = parseFloat(row.total_price_usdc);
+  // Recompute the totals from the breakdown in integer base units rather than
+  // trusting the stored decimal, so a corrupted or hand-edited row can never
+  // cause an under-payment to slip through.
+  const totalBaseUnits = (breakdown || []).reduce(
+    (sum: number, p: PublisherPaymentBreakdown) => sum + (p.amount_base_units || 0),
+    0
+  );
 
   return {
     id: row.id,
     quote_nonce: row.quote_nonce,
     query_text: row.query_text,
-    matched_chunk_ids: typeof row.matched_chunk_ids === 'string' ? JSON.parse(row.matched_chunk_ids) : row.matched_chunk_ids,
+    matched_chunk_ids:
+      typeof row.matched_chunk_ids === 'string'
+        ? JSON.parse(row.matched_chunk_ids)
+        : row.matched_chunk_ids,
     publisher_breakdown: breakdown,
-    total_price_usdc: totalUsdc,
-    total_base_units: Math.round(totalUsdc * 1_000_000),
+    total_price_usdc: fromBaseUnits(totalBaseUnits),
+    total_base_units: totalBaseUnits,
     memo_expected: row.memo_expected,
     expires_at: row.expires_at,
     status: row.status,
     created_at: row.created_at,
   };
 }
+
+/**
+ * Marks a quote as expired. Called opportunistically so the `status` column
+ * reflects reality without needing a background job.
+ */
+export async function markQuoteExpired(quoteId: string): Promise<void> {
+  await query(
+    `UPDATE payment_quotes SET status = 'EXPIRED'
+     WHERE id = $1 AND status = 'PENDING' AND expires_at < NOW()`,
+    [quoteId]
+  );
+}
+
+/** Re-exported for convenience so callers do not need two imports. */
+export { SETTLEMENT_ASSET, computeSha256 };

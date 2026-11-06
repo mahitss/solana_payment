@@ -1,96 +1,275 @@
-import { query, pool } from '../lib/db';
+import { query, pool, withTransaction } from '../lib/db';
 
+/**
+ * Idempotent schema migration for CiteRail.
+ *
+ * Safe to run repeatedly: every statement is guarded with IF NOT EXISTS (or is
+ * a conditional ALTER), so re-running against an existing database is a no-op
+ * apart from backfilling new columns.
+ */
 async function migrate() {
   console.log('Starting CiteRail database migration...');
 
-  await query(`
-    CREATE TABLE IF NOT EXISTS publishers (
-      id VARCHAR(64) PRIMARY KEY,
-      wallet_address VARCHAR(44) UNIQUE NOT NULL,
-      name VARCHAR(100) NOT NULL,
-      email VARCHAR(255),
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+  await withTransaction(async (client) => {
+    // ------------------------------------------------------------------
+    // Publishers
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS publishers (
+        id VARCHAR(64) PRIMARY KEY,
+        wallet_address VARCHAR(44) UNIQUE NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Proof-of-ownership timestamp. NULL means the wallet has never signed the
+    // authentication challenge, so the publisher identity is unverified.
+    await client.query(`
+      ALTER TABLE publishers ADD COLUMN IF NOT EXISTS verified_at TIMESTAMP WITH TIME ZONE;
+    `);
+
+    // ------------------------------------------------------------------
+    // Authentication challenges (single-use, signed by the wallet)
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS auth_challenges (
+        id VARCHAR(64) PRIMARY KEY,
+        wallet_address VARCHAR(44) NOT NULL,
+        nonce VARCHAR(64) UNIQUE NOT NULL,
+        message TEXT NOT NULL,
+        issued_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        used_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_auth_challenges_wallet ON auth_challenges(wallet_address);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires ON auth_challenges(expires_at);
+    `);
+
+    // ------------------------------------------------------------------
+    // Documents
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS documents (
+        id VARCHAR(64) PRIMARY KEY,
+        publisher_id VARCHAR(64) REFERENCES publishers(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        file_type VARCHAR(10) NOT NULL,
+        content_hash VARCHAR(64) NOT NULL,
+        license_type VARCHAR(50) NOT NULL DEFAULT 'query_royalty_v1',
+        price_per_query_usdc NUMERIC(10, 6) NOT NULL DEFAULT 0.050000,
+        total_chunks INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Prevent a publisher from re-uploading byte-identical content, which
+    // would otherwise flood the corpus and dilute retrieval quality.
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_publisher_hash
+        ON documents(publisher_id, content_hash);
+    `);
+
+    // ------------------------------------------------------------------
+    // Document chunks
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS document_chunks (
+        id VARCHAR(64) PRIMARY KEY,
+        document_id VARCHAR(64) REFERENCES documents(id) ON DELETE CASCADE,
+        publisher_id VARCHAR(64) REFERENCES publishers(id) ON DELETE CASCADE,
+        chunk_index INT NOT NULL,
+        content TEXT NOT NULL,
+        content_hash VARCHAR(64) NOT NULL,
+        token_count INT NOT NULL,
+        search_vector TSVECTOR,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_chunks_search ON document_chunks USING gin(search_vector);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_chunks_doc ON document_chunks(document_id);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_chunks_pub ON document_chunks(publisher_id);
+    `);
+
+    // ------------------------------------------------------------------
+    // Payment quotes
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS payment_quotes (
+        id VARCHAR(64) PRIMARY KEY,
+        quote_nonce VARCHAR(64) UNIQUE NOT NULL,
+        query_text TEXT NOT NULL,
+        matched_chunk_ids JSONB NOT NULL,
+        publisher_breakdown JSONB NOT NULL,
+        total_price_usdc NUMERIC(10, 6) NOT NULL,
+        memo_expected VARCHAR(255) NOT NULL,
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_quotes_nonce ON payment_quotes(quote_nonce);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_quotes_status ON payment_quotes(status);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_quotes_expires ON payment_quotes(expires_at);
+    `);
+
+    // ------------------------------------------------------------------
+    // Settlement receipts
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS settlement_receipts (
+        id VARCHAR(64) PRIMARY KEY,
+        quote_id VARCHAR(64) REFERENCES payment_quotes(id),
+        tx_signature VARCHAR(90) UNIQUE NOT NULL,
+        payer_wallet VARCHAR(44) NOT NULL,
+        total_amount_usdc NUMERIC(10, 6) NOT NULL,
+        solana_slot BIGINT NOT NULL,
+        block_time TIMESTAMP WITH TIME ZONE NOT NULL,
+        memo_verified BOOLEAN NOT NULL DEFAULT true,
+        breakdown JSONB NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_receipts_sig ON settlement_receipts(tx_signature);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_receipts_quote ON settlement_receipts(quote_id);
+    `);
+
+    // Which asset actually moved on-chain, and in which units. The previous
+    // schema conflated USDC base units with lamports, which made it impossible
+    // to tell a real USDC settlement from a native SOL one after the fact.
+    await client.query(`
+      ALTER TABLE settlement_receipts
+        ADD COLUMN IF NOT EXISTS settlement_asset VARCHAR(16) NOT NULL DEFAULT 'USDC';
+    `);
+    await client.query(`
+      ALTER TABLE settlement_receipts
+        ADD COLUMN IF NOT EXISTS settlement_amount_base_units BIGINT NOT NULL DEFAULT 0;
+    `);
+
+    // ------------------------------------------------------------------
+    // Normalised settlement payouts
+    //
+    // The per-publisher split used to live only inside a JSONB blob on the
+    // receipt, which made per-publisher royalty accounting a full-table scan
+    // in application code. This table makes it indexable.
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS settlement_payouts (
+        id VARCHAR(64) PRIMARY KEY,
+        receipt_id VARCHAR(64) NOT NULL REFERENCES settlement_receipts(id) ON DELETE CASCADE,
+        quote_id VARCHAR(64) NOT NULL,
+        publisher_id VARCHAR(64) REFERENCES publishers(id) ON DELETE SET NULL,
+        publisher_wallet VARCHAR(44) NOT NULL,
+        publisher_name VARCHAR(100),
+        amount_base_units BIGINT NOT NULL,
+        amount_usdc NUMERIC(12, 6) NOT NULL,
+        asset VARCHAR(16) NOT NULL DEFAULT 'USDC',
+        tx_signature VARCHAR(90) NOT NULL,
+        block_time TIMESTAMP WITH TIME ZONE NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_payouts_receipt_wallet
+        ON settlement_payouts(receipt_id, publisher_wallet);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_payouts_publisher ON settlement_payouts(publisher_id);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_payouts_wallet ON settlement_payouts(publisher_wallet);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_payouts_created ON settlement_payouts(created_at DESC);
+    `);
+
+    // ------------------------------------------------------------------
+    // Query executions
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS query_executions (
+        id VARCHAR(64) PRIMARY KEY,
+        receipt_id VARCHAR(64) REFERENCES settlement_receipts(id),
+        query_text TEXT NOT NULL,
+        ai_provider VARCHAR(50) NOT NULL,
+        ai_model VARCHAR(50) NOT NULL,
+        generated_answer TEXT NOT NULL,
+        citations JSONB NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_query_exec_receipt ON query_executions(receipt_id);
+    `);
+
+    // Backfill payouts for receipts that were settled before this table
+    // existed, so historical revenue is not lost.
+    const backfill = await client.query(`
+      INSERT INTO settlement_payouts (
+        id, receipt_id, quote_id, publisher_id, publisher_wallet, publisher_name,
+        amount_base_units, amount_usdc, asset, tx_signature, block_time
+      )
+      SELECT
+        'pay_' || substr(md5(r.id || b.item->>'publisher_wallet'), 1, 32),
+        r.id,
+        r.quote_id,
+        p.id,
+        b.item->>'publisher_wallet',
+        b.item->>'publisher_name',
+        COALESCE((b.item->>'received_amount')::bigint, 0),
+        COALESCE(((b.item->>'received_amount')::numeric / 1000000), 0),
+        COALESCE(r.settlement_asset, 'USDC'),
+        r.tx_signature,
+        r.block_time
+      FROM settlement_receipts r
+      CROSS JOIN LATERAL jsonb_array_elements(r.breakdown) AS b(item)
+      LEFT JOIN publishers p ON p.wallet_address = b.item->>'publisher_wallet'
+      WHERE NOT EXISTS (
+        SELECT 1 FROM settlement_payouts sp
+        WHERE sp.receipt_id = r.id
+          AND sp.publisher_wallet = b.item->>'publisher_wallet'
+      )
+      ON CONFLICT DO NOTHING;
+    `);
+
+    console.log(
+      `  backfilled ${backfill.rowCount ?? 0} historical settlement payout(s)`
     );
+  });
 
-    CREATE TABLE IF NOT EXISTS documents (
-      id VARCHAR(64) PRIMARY KEY,
-      publisher_id VARCHAR(64) REFERENCES publishers(id) ON DELETE CASCADE,
-      title VARCHAR(255) NOT NULL,
-      file_type VARCHAR(10) NOT NULL,
-      content_hash VARCHAR(64) NOT NULL,
-      license_type VARCHAR(50) NOT NULL DEFAULT 'query_royalty_v1',
-      price_per_query_usdc NUMERIC(10, 6) NOT NULL DEFAULT 0.050000,
-      total_chunks INT NOT NULL DEFAULT 0,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS document_chunks (
-      id VARCHAR(64) PRIMARY KEY,
-      document_id VARCHAR(64) REFERENCES documents(id) ON DELETE CASCADE,
-      publisher_id VARCHAR(64) REFERENCES publishers(id) ON DELETE CASCADE,
-      chunk_index INT NOT NULL,
-      content TEXT NOT NULL,
-      content_hash VARCHAR(64) NOT NULL,
-      token_count INT NOT NULL,
-      search_vector TSVECTOR,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_chunks_search ON document_chunks USING gin(search_vector);
-    CREATE INDEX IF NOT EXISTS idx_chunks_doc ON document_chunks(document_id);
-    CREATE INDEX IF NOT EXISTS idx_chunks_pub ON document_chunks(publisher_id);
-
-    CREATE TABLE IF NOT EXISTS payment_quotes (
-      id VARCHAR(64) PRIMARY KEY,
-      quote_nonce VARCHAR(64) UNIQUE NOT NULL,
-      query_text TEXT NOT NULL,
-      matched_chunk_ids JSONB NOT NULL,
-      publisher_breakdown JSONB NOT NULL,
-      total_price_usdc NUMERIC(10, 6) NOT NULL,
-      memo_expected VARCHAR(255) NOT NULL,
-      expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-      status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_quotes_nonce ON payment_quotes(quote_nonce);
-    CREATE INDEX IF NOT EXISTS idx_quotes_status ON payment_quotes(status);
-
-    CREATE TABLE IF NOT EXISTS settlement_receipts (
-      id VARCHAR(64) PRIMARY KEY,
-      quote_id VARCHAR(64) REFERENCES payment_quotes(id),
-      tx_signature VARCHAR(90) UNIQUE NOT NULL,
-      payer_wallet VARCHAR(44) NOT NULL,
-      total_amount_usdc NUMERIC(10, 6) NOT NULL,
-      solana_slot BIGINT NOT NULL,
-      block_time TIMESTAMP WITH TIME ZONE NOT NULL,
-      memo_verified BOOLEAN NOT NULL DEFAULT true,
-      breakdown JSONB NOT NULL,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_receipts_sig ON settlement_receipts(tx_signature);
-    CREATE INDEX IF NOT EXISTS idx_receipts_quote ON settlement_receipts(quote_id);
-
-    CREATE TABLE IF NOT EXISTS query_executions (
-      id VARCHAR(64) PRIMARY KEY,
-      receipt_id VARCHAR(64) REFERENCES settlement_receipts(id),
-      query_text TEXT NOT NULL,
-      ai_provider VARCHAR(50) NOT NULL,
-      ai_model VARCHAR(50) NOT NULL,
-      generated_answer TEXT NOT NULL,
-      citations JSONB NOT NULL,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_query_exec_receipt ON query_executions(receipt_id);
-  `);
-
+  // Verify the schema is actually usable before reporting success.
+  const tables = await query<{ table_name: string }>(
+    `SELECT table_name FROM information_schema.tables
+     WHERE table_schema='public' ORDER BY table_name`
+  );
+  console.log('Tables present:', tables.rows.map((t) => t.table_name).join(', '));
   console.log('Database tables, constraints, and indexes created successfully.');
-  await pool.end();
 }
 
-migrate().catch((err) => {
-  console.error('Migration failed:', err);
-  process.exit(1);
-});
+migrate()
+  .then(async () => {
+    await pool.end();
+  })
+  .catch((err) => {
+    console.error('Migration failed:', err);
+    process.exit(1);
+  });

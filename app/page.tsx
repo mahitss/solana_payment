@@ -58,8 +58,23 @@ interface Citation {
 }
 
 function CiteRailDashboard() {
-  const { connected, publicKey, connectWallet, disconnectWallet, sendSettlementTransaction } = useWallet();
+  const {
+    connected,
+    publicKey,
+    connectWallet,
+    disconnectWallet,
+    signMessage,
+    sendSettlementTransaction,
+  } = useWallet();
   const [activeTab, setActiveTab] = useState<'consumer' | 'publisher' | 'verifier'>('consumer');
+
+  // Wallet-based session. The token is what proves to the server that this
+  // browser controls the connected wallet; publishing and reading private
+  // publisher economics both require it.
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [authWallet, setAuthWallet] = useState<string | null>(null);
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   // Consumer Query State
   const [queryInput, setQueryInput] = useState('');
@@ -101,17 +116,85 @@ function CiteRailDashboard() {
   useEffect(() => {
     if (publicKey) {
       setPublisherWalletInput(publicKey);
+      setAuthToken(null);
+      setAuthWallet(null);
+      setAuthError(null);
       fetchPublisherEconomics(publicKey);
+    } else {
+      setAuthToken(null);
+      setAuthWallet(null);
+      setPublisherData(null);
     }
   }, [publicKey]);
 
-  const fetchPublisherEconomics = async (wallet: string) => {
+  /**
+   * Proves ownership of the connected wallet by signing a server-issued
+   * challenge. The resulting bearer token authorises publisher operations.
+   */
+  const authenticate = async () => {
+    if (!publicKey) {
+      setAuthError('Connect a wallet first.');
+      return;
+    }
+
+    setIsAuthenticating(true);
+    setAuthError(null);
+
+    try {
+      const challengeRes = await fetch('/api/auth/challenge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wallet: publicKey }),
+      });
+      const challengeData = await challengeRes.json();
+      if (!challengeData.success) {
+        throw new Error(challengeData.error || 'Failed to create sign-in challenge.');
+      }
+
+      const signature = await signMessage(challengeData.message);
+
+      const verifyRes = await fetch('/api/auth/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wallet: publicKey,
+          message: challengeData.message,
+          signature,
+        }),
+      });
+      const verifyData = await verifyRes.json();
+      if (!verifyData.success) {
+        throw new Error(verifyData.error || 'Signature verification failed.');
+      }
+
+      setAuthToken(verifyData.token);
+      setAuthWallet(verifyData.wallet);
+      fetchPublisherEconomics(verifyData.wallet, verifyData.token);
+    } catch (err: any) {
+      setAuthError(err.message);
+    } finally {
+      setIsAuthenticating(false);
+    }
+  };
+
+  const fetchPublisherEconomics = async (wallet: string, token?: string | null) => {
+    // Economics are private to the wallet owner, so they are only fetched once
+    // a session token exists.
+    if (!token) {
+      setPublisherData(null);
+      return;
+    }
+
     setIsLoadingPublisher(true);
     try {
-      const res = await fetch(`/api/publisher/economics?wallet=${wallet}`);
+      const res = await fetch('/api/publisher/economics', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
       const data = await res.json();
       if (data.success && data.registered) {
         setPublisherData(data.publisher);
+      } else if (data.success) {
+        setPublisherData(null);
       }
     } catch (err) {
       console.error(err);
@@ -176,11 +259,10 @@ function CiteRailDashboard() {
     setSettlementError(null);
 
     try {
-      // 1. User signs and sends atomic payment transaction on Solana Devnet
+      // 1. User signs and sends the atomic USDC settlement transaction.
       const txSignature = await sendSettlementTransaction({
         publisherBreakdown: quote.publisherBreakdown,
         memoExpected: quote.memoExpected,
-        useUsdc: false, // Uses native SOL fallback or USDC on Devnet
       });
 
       // 2. Send transaction signature to server-side settlement gatekeeper
@@ -195,6 +277,24 @@ function CiteRailDashboard() {
       });
 
       const settleData = await settleRes.json();
+
+      // The payment may have settled on-chain even when answer generation
+      // failed. Surface that honestly rather than hiding it behind a generic
+      // error, and make sure the receipt is still shown.
+      if (!settleData.success && settleData.paymentSettled) {
+        setSettlementError(settleData.error);
+        if (settleData.receipt) {
+          setAnswerData({
+            answer: '',
+            citations: [],
+            provider: '',
+            model: '',
+            receipt: settleData.receipt,
+          });
+        }
+        return;
+      }
+
       if (!settleData.success) {
         throw new Error(settleData.error || 'Server settlement verification failed.');
       }
@@ -208,8 +308,8 @@ function CiteRailDashboard() {
       });
 
       // Refresh publisher economics if publisher is connected
-      if (publicKey) {
-        fetchPublisherEconomics(publicKey);
+      if (publicKey && authToken) {
+        fetchPublisherEconomics(publicKey, authToken);
       }
     } catch (err: any) {
       console.error(err);
@@ -222,12 +322,23 @@ function CiteRailDashboard() {
   // 3. Publisher: Upload Document
   const handleUploadDocument = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!publisherWalletInput.trim()) {
-      setUploadError('Solana wallet address is required.');
+
+    // Publishing requires proof of wallet ownership. Without it anyone could
+    // publish under any wallet address and collect the royalties.
+    if (!authToken) {
+      setUploadError('Sign in with your wallet before publishing.');
+      return;
+    }
+    if (!publicKey || authWallet !== publicKey) {
+      setUploadError('Your wallet session is not active. Please sign in again.');
       return;
     }
     if (!docTitle.trim()) {
       setUploadError('Document title is required.');
+      return;
+    }
+    if (!docPrice || Number.isNaN(Number.parseFloat(docPrice)) || Number.parseFloat(docPrice) <= 0) {
+      setUploadError('Price per query must be a positive number.');
       return;
     }
 
@@ -236,13 +347,13 @@ function CiteRailDashboard() {
     setUploadSuccess(null);
 
     try {
+      const authHeaders = { Authorization: `Bearer ${authToken}` };
       let res;
       if (docFileType === 'pdf') {
         if (!pdfFile) {
           throw new Error('Please select a PDF file to upload.');
         }
         const formData = new FormData();
-        formData.append('publisherWallet', publisherWalletInput.trim());
         formData.append('publisherName', publisherNameInput.trim() || 'Verified Publisher');
         formData.append('title', docTitle.trim());
         formData.append('pricePerQueryUsdc', docPrice);
@@ -250,6 +361,7 @@ function CiteRailDashboard() {
 
         res = await fetch('/api/documents', {
           method: 'POST',
+          headers: authHeaders,
           body: formData,
         });
       } else {
@@ -258,9 +370,8 @@ function CiteRailDashboard() {
         }
         res = await fetch('/api/documents', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { ...authHeaders, 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            publisherWallet: publisherWalletInput.trim(),
             publisherName: publisherNameInput.trim() || 'Verified Publisher',
             title: docTitle.trim(),
             content: docContent.trim(),
@@ -279,7 +390,7 @@ function CiteRailDashboard() {
       setDocTitle('');
       setDocContent('');
       setPdfFile(null);
-      fetchPublisherEconomics(publisherWalletInput.trim());
+      fetchPublisherEconomics(publicKey, authToken);
     } catch (err: any) {
       setUploadError(err.message);
     } finally {
@@ -593,7 +704,13 @@ function CiteRailDashboard() {
 
                   {/* Body text with citations */}
                   <div className="text-gray-200 leading-relaxed text-sm whitespace-pre-wrap font-sans">
-                    {answerData.answer}
+                    {answerData.answer || (
+                      <span className="text-amber-400">
+                        The payment settled on-chain, but the answer could not be
+                        generated. Retry to regenerate it from the same paid
+                        sources — you will not be charged again.
+                      </span>
+                    )}
                   </div>
 
                   {/* Exact Sources Citations */}
@@ -661,6 +778,13 @@ function CiteRailDashboard() {
                       <span className="text-emerald-400">{answerData.receipt.slot}</span>
                     </div>
                     <div>
+                      <span className="text-gray-500">Total Royalty Paid: </span>
+                      <span className="text-emerald-400">
+                        ${answerData.receipt.totalAmountUsdc?.toFixed(4)}{' '}
+                        {answerData.receipt.settlementAsset || 'USDC'}
+                      </span>
+                    </div>
+                    <div>
                       <span className="text-gray-500">Memo Verified: </span>
                       <span className="text-emerald-400">TRUE (Binding cryptographically matched)</span>
                     </div>
@@ -712,6 +836,52 @@ function CiteRailDashboard() {
                 <h3 className="font-bold text-lg text-white">Publish New Knowledge</h3>
               </div>
 
+              {/* Wallet ownership proof */}
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-gray-800 bg-[#12141d] p-4">
+                <div className="text-xs text-gray-400">
+                  {authToken ? (
+                    <span className="flex items-center gap-2 text-emerald-400">
+                      <ShieldCheck className="w-4 h-4" />
+                      Wallet verified &mdash; publishing as{' '}
+                      <span className="font-mono">
+                        {authWallet?.slice(0, 4)}...{authWallet?.slice(-4)}
+                      </span>
+                    </span>
+                  ) : (
+                    <span>
+                      Sign a message with your wallet to prove you own{' '}
+                      <span className="font-mono text-gray-300">
+                        {publicKey
+                          ? `${publicKey.slice(0, 4)}...${publicKey.slice(-4)}`
+                          : '(connect a wallet first)'}
+                      </span>
+                      . This is a free signature, not a transaction.
+                    </span>
+                  )}
+                </div>
+                {!authToken && (
+                  <button
+                    type="button"
+                    onClick={authenticate}
+                    disabled={isAuthenticating || !connected}
+                    className="shrink-0 rounded-lg bg-purple-600/20 text-purple-300 border border-purple-500/30 px-4 py-2 text-xs font-semibold hover:bg-purple-600/30 disabled:opacity-50"
+                  >
+                    {isAuthenticating
+                      ? 'Verifying signature...'
+                      : connected
+                        ? 'Sign in to publish'
+                        : 'Connect wallet'}
+                  </button>
+                )}
+              </div>
+
+              {authError && (
+                <div className="p-3 rounded-lg bg-red-950/40 border border-red-500/30 text-red-300 text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 flex-shrink-0 text-red-400" />
+                  <span>{authError}</span>
+                </div>
+              )}
+
               <form onSubmit={handleUploadDocument} className="space-y-4">
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
@@ -721,11 +891,16 @@ function CiteRailDashboard() {
                     <input
                       type="text"
                       value={publisherWalletInput}
-                      onChange={(e) => setPublisherWalletInput(e.target.value)}
-                      placeholder="e.g. 5xX4... on Devnet"
-                      className="w-full bg-[#161824] border border-gray-700 rounded-xl px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-purple-500 font-mono"
+                      readOnly
+                      placeholder="Connect a wallet to publish"
+                      className="w-full bg-[#161824] border border-gray-700 rounded-xl px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-purple-500 font-mono cursor-not-allowed"
                       required
                     />
+                    <p className="text-[11px] text-gray-500 mt-1">
+                      The wallet address is taken from your connected wallet and cannot
+                      be typed in, so royalties can never be attributed to a wallet you
+                      do not control.
+                    </p>
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-gray-400 mb-1">
@@ -823,7 +998,7 @@ function CiteRailDashboard() {
 
                 <button
                   type="submit"
-                  disabled={isUploading}
+                  disabled={isUploading || !authToken}
                   className="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white font-bold py-3 px-6 rounded-xl transition shadow-lg shadow-purple-600/30 flex items-center justify-center gap-2 text-sm"
                 >
                   {isUploading ? (
@@ -953,7 +1128,10 @@ function CiteRailDashboard() {
                   </div>
                   <div className="flex justify-between py-1 border-b border-gray-800/40">
                     <span className="text-gray-500">Total Royalty Paid:</span>
-                    <span className="text-emerald-400 font-bold">${verifiedReceipt.totalAmountUsdc.toFixed(4)} USDC</span>
+                    <span className="text-emerald-400 font-bold">
+                      ${verifiedReceipt.totalAmountUsdc.toFixed(4)}{' '}
+                      {verifiedReceipt.settlementAsset || 'USDC'}
+                    </span>
                   </div>
                   <div className="flex justify-between py-1 border-b border-gray-800/40">
                     <span className="text-gray-500">Memo Program Binding:</span>
@@ -975,7 +1153,8 @@ function CiteRailDashboard() {
                       >
                         <span className="text-gray-400">{item.publisher_wallet}</span>
                         <span className="text-emerald-400 font-bold">
-                          {(item.received_amount / 1_000_000).toFixed(4)} USDC
+                          {(item.received_amount / 1_000_000).toFixed(4)}{' '}
+                          {verifiedReceipt.settlementAsset || 'USDC'}
                         </span>
                       </div>
                     ))}

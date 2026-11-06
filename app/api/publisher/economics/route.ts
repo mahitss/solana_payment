@@ -1,23 +1,38 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
-import { getPublisherByWallet, isValidSolanaAddress } from '@/lib/publishers';
+import { getPublisherByWallet } from '@/lib/publishers';
+import { AuthError, requireAuth } from '@/lib/auth';
+import { config } from '@/lib/config';
+import { SETTLEMENT_ASSET } from '@/lib/protocol';
 
+export const dynamic = 'force-dynamic';
+
+/**
+ * Publisher economics.
+ *
+ * Requires an authenticated wallet session and returns only the authenticated
+ * wallet's own revenue. Previously this endpoint accepted any wallet address
+ * as a query parameter and returned that publisher's full earnings ledger and
+ * query history to whoever asked.
+ *
+ * Aggregation happens in SQL against the indexed `settlement_payouts` table.
+ * The previous implementation loaded every receipt in the database and
+ * filtered the JSONB breakdown in application code, which was O(all receipts)
+ * per request.
+ */
 export async function GET(req: Request) {
   try {
-    const { searchParams } = new URL(req.url);
-    const wallet = searchParams.get('wallet');
-
-    if (!wallet || !isValidSolanaAddress(wallet)) {
-      return NextResponse.json(
-        { success: false, error: 'A valid Solana wallet address is required.' },
-        { status: 400 }
-      );
-    }
+    const session = requireAuth(req);
+    const wallet = session.wallet;
 
     const publisher = await getPublisherByWallet(wallet);
     if (!publisher) {
       return NextResponse.json(
-        { success: true, registered: false, message: 'Wallet is not yet registered as a publisher.' },
+        {
+          success: true,
+          registered: false,
+          message: 'Wallet is not yet registered as a publisher.',
+        },
         { status: 200 }
       );
     }
@@ -31,47 +46,48 @@ export async function GET(req: Request) {
       [publisher.id]
     );
 
-    // 2. Fetch all verified receipts involving this publisher's wallet
-    const receiptsRes = await query(
-      `SELECT r.id, r.tx_signature, r.payer_wallet, r.total_amount_usdc, r.block_time, r.solana_slot, r.breakdown,
-              q.query_text
-       FROM settlement_receipts r
-       JOIN payment_quotes q ON r.quote_id = q.id
-       ORDER BY r.block_time DESC`
+    // 2. Aggregated revenue and ledger from the normalised payout table
+    const summaryRes = await query(
+      `SELECT
+         COALESCE(SUM(amount_base_units), 0)::bigint AS total_base_units,
+         COUNT(*)::int AS payout_count
+       FROM settlement_payouts
+       WHERE publisher_wallet = $1`,
+      [wallet]
     );
 
-    let totalEarnedUsdc = 0;
-    let queryCount = 0;
-    const ledger: Array<{
-      receipt_id: string;
-      tx_signature: string;
-      payer_wallet: string;
-      amount_earned_usdc: number;
-      query_text: string;
-      block_time: string;
-      explorer_url: string;
-    }> = [];
+    const ledgerRes = await query(
+      `SELECT
+         receipt_id,
+         tx_signature,
+         quote_id,
+         publisher_name,
+         amount_base_units,
+         amount_usdc,
+         asset,
+         block_time
+       FROM settlement_payouts
+       WHERE publisher_wallet = $1
+       ORDER BY block_time DESC
+       LIMIT 200`,
+      [wallet]
+    );
 
-    for (const row of receiptsRes.rows) {
-      const breakdown = typeof row.breakdown === 'string' ? JSON.parse(row.breakdown) : row.breakdown;
-      if (Array.isArray(breakdown)) {
-        const item = breakdown.find((b: any) => b.publisher_wallet === wallet);
-        if (item && item.received_amount) {
-          const earned = item.received_amount / 1_000_000;
-          totalEarnedUsdc += earned;
-          queryCount++;
-          ledger.push({
-            receipt_id: row.id,
-            tx_signature: row.tx_signature,
-            payer_wallet: row.payer_wallet,
-            amount_earned_usdc: earned,
-            query_text: row.query_text,
-            block_time: row.block_time,
-            explorer_url: `https://explorer.solana.com/tx/${row.tx_signature}?cluster=devnet`,
-          });
-        }
-      }
-    }
+    const totalBaseUnits = Number(summaryRes.rows[0]?.total_base_units ?? 0);
+    const totalEarnedUsdc = totalBaseUnits / 1_000_000;
+
+    const ledger = ledgerRes.rows.map((row: any) => ({
+      receipt_id: row.receipt_id,
+      tx_signature: row.tx_signature,
+      quote_id: row.quote_id,
+      publisher_name: row.publisher_name,
+      amount_earned_usdc: Number(row.amount_usdc),
+      amount_base_units: Number(row.amount_base_units),
+      asset: row.asset || SETTLEMENT_ASSET,
+      query_text: null,
+      block_time: row.block_time,
+      explorer_url: `https://explorer.solana.com/tx/${row.tx_signature}?cluster=${config.solanaNetwork}`,
+    }));
 
     return NextResponse.json({
       success: true,
@@ -81,13 +97,22 @@ export async function GET(req: Request) {
         walletAddress: publisher.wallet_address,
         name: publisher.name,
         email: publisher.email,
+        verified: Boolean(publisher.verified_at),
         totalRevenueUsdc: totalEarnedUsdc,
-        totalQueriesAnswered: queryCount,
+        totalQueriesAnswered: summaryRes.rows[0]?.payout_count ?? 0,
+        settlementAsset: SETTLEMENT_ASSET,
         documents: docsRes.rows,
         ledger,
       },
     });
   } catch (err: any) {
+    if (err instanceof AuthError) {
+      return NextResponse.json(
+        { success: false, error: err.message, code: err.code },
+        { status: err.status }
+      );
+    }
+    console.error('Publisher economics error:', err);
     return NextResponse.json({ success: false, error: err.message }, { status: 500 });
   }
 }

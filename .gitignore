@@ -28,3 +28,10 @@ yarn-error.log*
 .env.development.local
 .env.test.local
 .env.production.local
+
+# graphify knowledge-graph output
+/graphify-out/
+
+# local inspection / scratch
+.inspect-*
+*.tsbuildinfo
