@@ -109,7 +109,6 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   private readonly baseUrl: string;
 
   private static readonly MAX_BATCH_SIZE = 64;
-  private static readonly MAX_CONCURRENT = 4;
 
   constructor(baseUrl: string, modelId: string, dimensions: number) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
@@ -118,15 +117,16 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   }
 
   /**
-   * Calls Ollama `/api/embed` with bounded concurrency and retries.
+   * Calls Ollama `/api/embed` with bounded batching and retries.
+   * Batches are processed sequentially to preserve result ordering.
    */
   private async embedBatch(texts: string[]): Promise<number[][]> {
     if (texts.length === 0) return [];
 
     const results: number[][] = [];
-    const concurrency = OllamaEmbeddingProvider.MAX_CONCURRENT;
 
-    // Process in bounded batches to avoid unbounded concurrent requests.
+    // Process in bounded batches sequentially to preserve result ordering.
+    // No concurrent requests: ordering guarantees and avoids unbounded parallelism.
     for (let i = 0; i < texts.length; i += OllamaEmbeddingProvider.MAX_BATCH_SIZE) {
       const batch = texts.slice(i, i + OllamaEmbeddingProvider.MAX_BATCH_SIZE);
       const batchVectors = await this.embedBatchWithRetry(batch);
@@ -151,7 +151,9 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
           (err.code === 'MODEL_NOT_FOUND' ||
             err.code === 'INVALID_VECTOR_STRUCTURE' ||
             err.code === 'INVALID_VECTOR_DIMENSIONS' ||
-            err.code === 'INVALID_VECTOR_VALUE')
+            err.code === 'INVALID_VECTOR_VALUE' ||
+            err.code === 'INVALID_VECTOR_COUNT' ||
+            err.code === 'INVALID_RESPONSE_STRUCTURE')
         ) {
           throw err;
         }
@@ -169,78 +171,114 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), config.aiRequestTimeoutMs);
 
+    let response: Response;
     try {
-      const response = await fetch(`${this.baseUrl}/api/embed`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: this.modelId,
-          input: texts,
+      response = await Promise.race([
+        fetch(`${this.baseUrl}/api/embed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: this.modelId,
+            input: texts,
+          }),
+          signal: controller.signal,
         }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
-        if (response.status === 404 || errorText.includes('model not found')) {
-          throw new EmbeddingProviderError(
-            `Ollama model not found: ${this.modelId}`,
-            'MODEL_NOT_FOUND'
-          );
-        }
-        throw new EmbeddingProviderError(
-          `Ollama embed request failed with status ${response.status}: ${errorText}`,
-          'OLLAMA_REQUEST_FAILED'
-        );
-      }
-
-      const body = (await response.json()) as any;
-      if (!body || !Array.isArray(body.embeddings)) {
-        throw new EmbeddingProviderError(
-          'Ollama embed response missing embeddings array',
-          'INVALID_RESPONSE_STRUCTURE'
-        );
-      }
-
-      if (body.embeddings.length !== texts.length) {
-        throw new EmbeddingProviderError(
-          `Ollama returned ${body.embeddings.length} embeddings for ${texts.length} inputs`,
-          'INVALID_VECTOR_COUNT'
-        );
-      }
-
-      const vectors: number[][] = [];
-      for (let i = 0; i < body.embeddings.length; i++) {
-        vectors.push(
-          validateVector(
-            body.embeddings[i],
-            this.dimensions,
-            `Ollama embedding ${i}`
-          )
-        );
-      }
-
-      return vectors;
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error('timeout')), config.aiRequestTimeoutMs);
+        }),
+      ]) as Response;
     } catch (err: any) {
       clearTimeout(timeoutId);
-      if (err.name === 'AbortError') {
+      if (err.name === 'AbortError' || err.message === 'timeout') {
         throw new EmbeddingProviderError(
           `Ollama embed request timed out after ${config.aiRequestTimeoutMs}ms`,
           'EMBEDDING_TIMEOUT'
         );
       }
-      throw err;
+      throw new EmbeddingProviderError(
+        `Ollama embed request failed: ${err instanceof Error ? err.message : String(err)}`,
+        'OLLAMA_REQUEST_FAILED'
+      );
     }
+
+    // Keep the timeout active through body reading and validation.
+    let errorText = '';
+    try {
+      errorText = await response.text();
+    } catch (err: any) {
+      clearTimeout(timeoutId);
+      throw new EmbeddingProviderError(
+        `Failed to read Ollama response body: ${err instanceof Error ? err.message : String(err)}`,
+        'OLLAMA_READ_FAILED'
+      );
+    }
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      if (response.status === 404 || errorText.includes('model not found')) {
+        throw new EmbeddingProviderError(
+          `Ollama model not found: ${this.modelId}`,
+          'MODEL_NOT_FOUND'
+        );
+      }
+      throw new EmbeddingProviderError(
+        `Ollama embed request failed with status ${response.status}: ${errorText}`,
+        'OLLAMA_REQUEST_FAILED'
+      );
+    }
+
+    let body: any;
+    try {
+      body = JSON.parse(errorText);
+    } catch {
+      throw new EmbeddingProviderError(
+        'Ollama embed response is not valid JSON',
+        'INVALID_RESPONSE_STRUCTURE'
+      );
+    }
+
+    if (!body || !Array.isArray(body.embeddings)) {
+      throw new EmbeddingProviderError(
+        'Ollama embed response missing embeddings array',
+        'INVALID_RESPONSE_STRUCTURE'
+      );
+    }
+
+    if (body.embeddings.length !== texts.length) {
+      throw new EmbeddingProviderError(
+        `Ollama returned ${body.embeddings.length} embeddings for ${texts.length} inputs`,
+        'INVALID_VECTOR_COUNT'
+      );
+    }
+
+    const vectors: number[][] = [];
+    for (let i = 0; i < body.embeddings.length; i++) {
+      vectors.push(
+        validateVector(
+          body.embeddings[i],
+          this.dimensions,
+          `Ollama embedding ${i}`
+        )
+      );
+    }
+
+    return vectors;
   }
 
   async embedDocuments(texts: string[]): Promise<number[][]> {
+    // Preserve exact positional mapping: one vector per input, same order.
+    // Reject empty-string input explicitly rather than silently dropping it.
+    for (let i = 0; i < texts.length; i++) {
+      if (!texts[i] || !texts[i].trim()) {
+        throw new EmbeddingProviderError(
+          `embedDocuments: input at index ${i} is empty or whitespace-only`,
+          'EMPTY_INPUT_TEXT'
+        );
+      }
+    }
     if (texts.length === 0) return [];
-    // Filter out empty strings but preserve positions for consistent indexing.
-    const nonEmptyTexts = texts.filter((t) => t.trim().length > 0);
-    if (nonEmptyTexts.length === 0) return [];
-    return this.embedBatch(nonEmptyTexts);
+    return this.embedBatch(texts);
   }
 
   async embedQuery(text: string): Promise<number[]> {
@@ -265,6 +303,13 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
 export function createEmbeddingProvider(): EmbeddingProvider | null {
   const provider = (process.env.EMBEDDING_PROVIDER || 'ollama').toLowerCase();
 
+  if (provider === 'none') {
+    console.info(
+      '[embedding] Embedding provider disabled (EMBEDDING_PROVIDER=none); FTS-only retrieval active.'
+    );
+    return null;
+  }
+
   if (provider !== 'ollama') {
     console.warn(
       `[embedding] Unknown embedding provider "${provider}"; falling back to FTS-only retrieval.`
@@ -272,16 +317,16 @@ export function createEmbeddingProvider(): EmbeddingProvider | null {
     return null;
   }
 
-  const baseUrl = process.env.OLLAMA_EMBEDDING_BASE_URL || config.ollamaBaseUrl;
-  const modelId = process.env.OLLAMA_EMBEDDING_MODEL || 'embeddinggemma';
-  const dimensions = Number.parseInt(
-    process.env.EMBEDDING_DIMENSIONS || '768',
-    10
-  );
+  // Use the dedicated embedding base URL. Never fall back to the answer-generation
+  // OLLAMA_BASE_URL, which could point to an external endpoint unsuitable for
+  // publisher content.
+  const baseUrl = config.ollamaEmbeddingBaseUrl;
+  const modelId = config.ollamaEmbeddingModel;
+  const dimensions = config.embeddingDimensions;
 
   if (!Number.isFinite(dimensions) || dimensions <= 0) {
     throw new Error(
-      `EMBEDDING_DIMENSIONS must be a positive integer, received "${process.env.EMBEDDING_DIMENSIONS}"`
+      `EMBEDDING_DIMENSIONS must be a positive integer, received "${config.embeddingDimensions}"`
     );
   }
 
@@ -301,4 +346,12 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
     embeddingProviderInstance = createEmbeddingProvider();
   }
   return embeddingProviderInstance;
+}
+
+/**
+ * Resets the singleton provider instance. Used by tests to simulate
+ * different configurations without relying on environment variable ordering.
+ */
+export function resetEmbeddingProvider(): void {
+  embeddingProviderInstance = undefined;
 }

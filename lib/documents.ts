@@ -3,6 +3,7 @@ import { query, withTransaction } from './db';
 import { getOrCreatePublisher } from './publishers';
 import { chunkText, computeSha256, parseMarkdown, parsePdfBuffer } from './chunker';
 import { getEmbeddingProvider } from './embedding';
+import { isSupportedLicenseType, getSupportedLicenseTypes } from './eligibility';
 
 export interface DocumentRecord {
   id: string;
@@ -99,7 +100,15 @@ export async function ingestDocument(params: {
   const price = requestedPrice;
   const license = params.licenseType || 'query_royalty_v1';
 
-  return withTransaction(async (client) => {
+  // Reject unsupported license types before any database write.
+  if (!isSupportedLicenseType(license)) {
+    throw new Error(
+      `Unsupported license type "${license}". Supported types: ${getSupportedLicenseTypes().join(', ')}.`
+    );
+  }
+
+  // Stage 1: Persist document and chunks in a single database transaction.
+  const docResult = await withTransaction(async (client) => {
     // Reject byte-identical re-uploads by the same publisher. Without this a
     // publisher can flood the corpus with copies of one document, diluting
     // retrieval quality for every other publisher.
@@ -117,8 +126,8 @@ export async function ingestDocument(params: {
 
     const insertDocSql = `
       INSERT INTO documents (
-        id, publisher_id, title, file_type, content_hash, license_type, price_per_query_usdc, total_chunks
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        id, publisher_id, title, file_type, content_hash, license_type, price_per_query_usdc, total_chunks, status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active')
       RETURNING *
     `;
     const docRes = await client.query(insertDocSql, [
@@ -165,23 +174,30 @@ export async function ingestDocument(params: {
       });
     }
 
-    // Generate embeddings for all chunks (best-effort; FTS remains available
-    // even if embedding generation fails).
-    const embeddingProvider = getEmbeddingProvider();
-    let embeddingStatus = 'skipped';
-    let embeddingCount = 0;
+    return { docRes, chunkInserts };
+  });
 
-    if (embeddingProvider) {
-      try {
-        const texts = chunkInserts.map((c) => c.content);
-        const vectors = await embeddingProvider.embedDocuments(texts);
+  // Stage 2: Generate embeddings OUTSIDE the database transaction. This
+  // prevents holding a PostgreSQL connection open during model inference,
+  // retries, and timeouts. Embedding failure does not roll back the ingested
+  // document or its FTS entries.
+  const embeddingProvider = getEmbeddingProvider();
+  let embeddingStatus = 'skipped';
+  let embeddingCount = 0;
 
+  if (embeddingProvider) {
+    try {
+      const texts = docResult.chunkInserts.map((c) => c.content);
+      const vectors = await embeddingProvider.embedDocuments(texts);
+
+      // Stage 3: Persist valid embeddings in a separate bounded transaction.
+      const persisted = await withTransaction(async (client) => {
         const insertEmbeddingSql = `
           INSERT INTO document_chunk_embeddings (
             id, chunk_id, document_id, provider, model_id, model_digest,
             dimensions, source_hash, embedding
           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-          ON CONFLICT (chunk_id, provider, model_id) DO UPDATE SET
+          ON CONFLICT (chunk_id, provider, model_id, model_digest) DO UPDATE SET
             document_id = EXCLUDED.document_id,
             model_digest = EXCLUDED.model_digest,
             dimensions = EXCLUDED.dimensions,
@@ -190,8 +206,9 @@ export async function ingestDocument(params: {
             created_at = CURRENT_TIMESTAMP
         `;
 
-        for (let i = 0; i < chunkInserts.length; i++) {
-          const chunk = chunkInserts[i];
+        let count = 0;
+        for (let i = 0; i < docResult.chunkInserts.length; i++) {
+          const chunk = docResult.chunkInserts[i];
           const vector = vectors[i];
           if (!vector) continue;
 
@@ -201,77 +218,124 @@ export async function ingestDocument(params: {
             docId,
             embeddingProvider.providerId,
             embeddingProvider.modelId,
-            undefined, // model_digest not available from Ollama embed API
+            '', // model_digest: Ollama embed API does not return a digest
             embeddingProvider.dimensions,
             chunk.contentHash,
-            JSON.stringify(vector), // pgvector accepts text format '[0.1,0.2,...]'
+            JSON.stringify(vector),
           ]);
-          embeddingCount++;
+          count++;
         }
+        return count;
+      });
 
-        embeddingStatus = embeddingCount === chunkInserts.length ? 'completed' : 'partial';
-      } catch (embedErr) {
-        // Embedding failure must not fail document ingestion. FTS remains
-        // fully functional.
-        console.error(
-          `[documents] Embedding generation failed for document ${docId}:`,
-          embedErr instanceof Error ? embedErr.message : String(embedErr)
-        );
-        embeddingStatus = 'failed';
-      }
+      embeddingCount = persisted;
+      embeddingStatus = embeddingCount === docResult.chunkInserts.length ? 'completed' : 'partial';
+    } catch (embedErr) {
+      // Embedding failure must not fail document ingestion. FTS remains
+      // fully functional. The missing/stale embedding state is recoverable
+      // by the backfill script.
+      console.error(
+        `[documents] Embedding generation failed for document ${docId}:`,
+        embedErr instanceof Error ? embedErr.message : String(embedErr)
+      );
+      embeddingStatus = 'failed';
     }
+  }
 
-    return {
-      id: docId,
-      publisher_id: publisher.id,
-      publisher_wallet: publisher.wallet_address,
-      publisher_name: publisher.name,
-      title: params.title.trim(),
-      file_type: params.fileType,
-      content_hash: docHash,
-      license_type: license,
-      price_per_query_usdc: price.toFixed(6),
-      total_chunks: chunks.length,
-      created_at: docRes.rows[0].created_at,
-      embeddingStatus,
-      embeddingCount,
-    };
-  });
+  return {
+    id: docId,
+    publisher_id: publisher.id,
+    publisher_wallet: publisher.wallet_address,
+    publisher_name: publisher.name,
+    title: params.title.trim(),
+    file_type: params.fileType,
+    content_hash: docHash,
+    license_type: license,
+    price_per_query_usdc: price.toFixed(6),
+    total_chunks: chunks.length,
+    created_at: docResult.docRes.rows[0].created_at,
+    embeddingStatus,
+    embeddingCount,
+  };
 }
 
 export async function listAllDocuments(limit = 100): Promise<DocumentRecord[]> {
   const sql = `
-    SELECT d.*, p.wallet_address as publisher_wallet, p.name as publisher_name
+    SELECT d.*, p.wallet_address as publisher_wallet, p.name as publisher_name,
+      COUNT(e.id) FILTER (WHERE e.source_hash = d.content_hash) AS embedding_count,
+      CASE
+        WHEN COUNT(e.id) FILTER (WHERE e.source_hash = d.content_hash) = 0 THEN 'skipped'
+        WHEN COUNT(e.id) FILTER (WHERE e.source_hash = d.content_hash) = d.total_chunks THEN 'completed'
+        ELSE 'partial'
+      END AS embedding_status
     FROM documents d
     JOIN publishers p ON d.publisher_id = p.id
+    LEFT JOIN document_chunk_embeddings e
+      ON e.document_id = d.id
+      AND e.source_hash = d.content_hash
+    GROUP BY d.id, p.wallet_address, p.name
     ORDER BY d.created_at DESC
     LIMIT $1;
   `;
   const res = await query(sql, [limit]);
-  return res.rows;
+  return res.rows.map((row: any) => ({
+    ...row,
+    embeddingStatus: row.embedding_status,
+    embeddingCount: Number(row.embedding_count ?? 0),
+  }));
 }
 
 export async function getDocumentById(id: string): Promise<DocumentRecord | null> {
   const sql = `
-    SELECT d.*, p.wallet_address as publisher_wallet, p.name as publisher_name
+    SELECT d.*, p.wallet_address as publisher_wallet, p.name as publisher_name,
+      COUNT(e.id) FILTER (WHERE e.source_hash = d.content_hash) AS embedding_count,
+      CASE
+        WHEN COUNT(e.id) FILTER (WHERE e.source_hash = d.content_hash) = 0 THEN 'skipped'
+        WHEN COUNT(e.id) FILTER (WHERE e.source_hash = d.content_hash) = d.total_chunks THEN 'completed'
+        ELSE 'partial'
+      END AS embedding_status
     FROM documents d
     JOIN publishers p ON d.publisher_id = p.id
+    LEFT JOIN document_chunk_embeddings e
+      ON e.document_id = d.id
+      AND e.source_hash = d.content_hash
     WHERE d.id = $1
+    GROUP BY d.id, p.wallet_address, p.name
   `;
   const res = await query(sql, [id]);
-  return res.rows[0] || null;
+  if (res.rows.length === 0) return null;
+  const row = res.rows[0];
+  return {
+    ...row,
+    embeddingStatus: row.embedding_status,
+    embeddingCount: Number(row.embedding_count ?? 0),
+  };
 }
 
 export async function listDocumentsByPublisher(
   publisherId: string
 ): Promise<DocumentRecord[]> {
   const sql = `
-    SELECT d.*, p.wallet_address as publisher_wallet, p.name as publisher_name
+    SELECT d.*, p.wallet_address as publisher_wallet, p.name as publisher_name,
+      COUNT(e.id) FILTER (WHERE e.source_hash = d.content_hash) AS embedding_count,
+      CASE
+        WHEN COUNT(e.id) FILTER (WHERE e.source_hash = d.content_hash) = 0 THEN 'skipped'
+        WHEN COUNT(e.id) FILTER (WHERE e.source_hash = d.content_hash) = d.total_chunks THEN 'completed'
+        ELSE 'partial'
+      END AS embedding_status
     FROM documents d
     JOIN publishers p ON d.publisher_id = p.id
+    LEFT JOIN document_chunk_embeddings e
+      ON e.document_id = d.id
+      AND e.source_hash = d.content_hash
     WHERE d.publisher_id = $1
+    GROUP BY d.id, p.wallet_address, p.name
     ORDER BY d.created_at DESC
   `;
   const res = await query(sql, [publisherId]);
-  return res.rows;
+  return res.rows.map((row: any) => ({
+    ...row,
+    embeddingStatus: row.embedding_status,
+    embeddingCount: Number(row.embedding_count ?? 0),
+  }));
 }

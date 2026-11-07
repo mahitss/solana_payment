@@ -50,6 +50,26 @@ async function migrate() {
       ALTER TABLE publishers ADD COLUMN IF NOT EXISTS verified_at TIMESTAMP WITH TIME ZONE;
     `);
 
+    // Publisher status: 'active' or 'revoked'. Revoked publishers are excluded
+    // from all retrieval paths.
+    await client.query(`
+      ALTER TABLE publishers ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'publishers_status_check'
+            AND conrelid = 'publishers'::regclass
+        ) THEN
+          ALTER TABLE publishers
+            ADD CONSTRAINT publishers_status_check
+            CHECK (status IN ('active', 'revoked'));
+        END IF;
+      END $$;
+    `);
+
     // ------------------------------------------------------------------
     // Authentication challenges (single-use, signed by the wallet)
     // ------------------------------------------------------------------
@@ -87,6 +107,26 @@ async function migrate() {
         total_chunks INT NOT NULL DEFAULT 0,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
+    `);
+
+    // Document status: 'active' or 'revoked'. Revoked documents are excluded
+    // from all retrieval paths.
+    await client.query(`
+      ALTER TABLE documents ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'documents_status_check'
+            AND conrelid = 'documents'::regclass
+        ) THEN
+          ALTER TABLE documents
+            ADD CONSTRAINT documents_status_check
+            CHECK (status IN ('active', 'revoked'));
+        END IF;
+      END $$;
     `);
 
     // Prevent a publisher from re-uploading byte-identical content, which
@@ -137,7 +177,7 @@ async function migrate() {
         document_id VARCHAR(64) NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
         provider VARCHAR(50) NOT NULL,
         model_id VARCHAR(100) NOT NULL,
-        model_digest VARCHAR(128),
+        model_digest VARCHAR(128) NOT NULL,
         dimensions INT NOT NULL,
         source_hash VARCHAR(64) NOT NULL,
         embedding vector NOT NULL,
@@ -145,10 +185,29 @@ async function migrate() {
       );
     `);
 
-    // One embedding per chunk per model version.
+    // One embedding per chunk per provider/model/digest version. Including
+    // model_digest ensures different model revisions behind the same model
+    // name cannot silently overwrite each other.
     await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_chunk_model
-        ON document_chunk_embeddings(chunk_id, provider, model_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_chunk_model_digest
+        ON document_chunk_embeddings(chunk_id, provider, model_id, model_digest);
+    `);
+
+    // Drop the old index that did not include model_digest, if it exists.
+    await client.query(`
+      DROP INDEX IF EXISTS idx_embeddings_chunk_model;
+    `);
+
+    // Backfill existing embedding rows: set model_digest to empty string
+    // where NULL, then enforce NOT NULL.
+    await client.query(`
+      UPDATE document_chunk_embeddings
+      SET model_digest = ''
+      WHERE model_digest IS NULL;
+    `);
+    await client.query(`
+      ALTER TABLE document_chunk_embeddings
+        ALTER COLUMN model_digest SET NOT NULL;
     `);
 
     // Fast lookup by chunk for invalidation.

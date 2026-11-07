@@ -27,6 +27,17 @@ services:
         value: https://ollama.com
       - key: OLLAMA_MODEL
         value: gemma3:4b
+      # Embedding provider is disabled by default on Render until a real private
+      # embedding service is configured. Never reuse OLLAMA_BASE_URL for
+      # publisher-content embeddings.
+      - key: EMBEDDING_PROVIDER
+        value: none
+      - key: OLLAMA_EMBEDDING_BASE_URL
+        value: http://127.0.0.1:11434
+      - key: OLLAMA_EMBEDDING_MODEL
+        value: embeddinggemma
+      - key: EMBEDDING_DIMENSIONS
+        value: "768"
       # Gemini fallback provider key - set in the Render dashboard.
       - key: GEMINI_API_KEY
         sync: false

@@ -1,6 +1,7 @@
 import { query } from './db';
 import { ChunkRecord } from './documents';
 import { getEmbeddingProvider } from './embedding';
+import { ELIGIBILITY_SQL_PREDICATE } from './eligibility';
 
 /**
  * Minimum fraction of the significant query terms that must appear in a chunk
@@ -40,6 +41,7 @@ interface RankedCandidate {
 
 /**
  * Full-text search retrieval path. Returns ranked candidates.
+ * Applies the same eligibility predicate as the semantic path.
  */
 async function ftsRetrieval(
   cleanQuery: string,
@@ -84,17 +86,18 @@ async function ftsRetrieval(
       JOIN documents d ON c.document_id = d.id
       JOIN publishers p ON c.publisher_id = p.id
       CROSS JOIN query_terms qt
+      WHERE ${ELIGIBILITY_SQL_PREDICATE}
     )
     SELECT *
     FROM scored_chunks
     WHERE rank_score > 0
        OR exact_match_score > 0
-       OR term_coverage >= $3
-    ORDER BY (rank_score * 2.0 + exact_match_score + term_coverage) DESC, chunk_index ASC
-    LIMIT $2;
+       OR term_coverage >= $2
+    ORDER BY (rank_score * 2.0 + exact_match_score + term_coverage) DESC, chunk_index ASC, document_id ASC, id ASC
+    LIMIT $3;
   `;
 
-  const res = await query(sql, [cleanQuery, limit, minCoverage]);
+  const res = await query(sql, [cleanQuery, minCoverage, limit]);
 
   return res.rows.map((row: any, i: number) => ({
     chunk: {
@@ -118,6 +121,7 @@ async function ftsRetrieval(
 /**
  * Semantic retrieval path using pgvector cosine distance.
  * Returns ranked candidates ordered by similarity (most similar first).
+ * Applies the same eligibility predicate as the FTS path.
  */
 async function semanticRetrieval(
   queryVector: number[],
@@ -144,12 +148,14 @@ async function semanticRetrieval(
     JOIN document_chunks c ON e.chunk_id = c.id
     JOIN documents d ON c.document_id = d.id
     JOIN publishers p ON c.publisher_id = p.id
-    WHERE e.provider = $2
+    WHERE ${ELIGIBILITY_SQL_PREDICATE}
+      AND e.provider = $2
       AND e.model_id = $3
       AND e.dimensions = $4
+      AND e.model_digest = $5
       AND e.source_hash = c.content_hash
-    ORDER BY e.embedding <=> $1::vector
-    LIMIT $5;
+    ORDER BY e.embedding <=> $1::vector, c.chunk_index ASC, d.id ASC, c.id ASC
+    LIMIT $6;
   `;
 
   const vectorText = `[${queryVector.join(',')}]`;
@@ -159,6 +165,7 @@ async function semanticRetrieval(
     provider.providerId,
     provider.modelId,
     provider.dimensions,
+    '', // model_digest: Ollama embed API does not return a digest
     limit,
   ]);
 
