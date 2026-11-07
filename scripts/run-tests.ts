@@ -24,6 +24,7 @@ import {
   verifySettlementTransaction,
   SolanaVerificationError,
   validateParsedSettlementTransaction,
+  DEVNET_USDC_MINT,
 } from '../lib/solana';
 import { buildGroundedPrompt, extractCitations } from '../lib/ai/provider';
 import { searchKnowledgeCollections } from '../lib/retrieval';
@@ -344,9 +345,14 @@ function makeParsedTx(params: {
     { pubkey: new PublicKey(params.buyerAta) },
   ];
 
-  // Add publisher ATAs as account keys
-  const pubATAs = [...new Set(params.transfers.map((t) => t.destination))];
-  for (const a of pubATAs) {
+  // Add all source and destination ATAs as account keys so token-balance
+  // metadata can resolve them via accountIndex.
+  const allATAs = new Set<string>([params.buyerAta]);
+  for (const t of params.transfers) {
+    allATAs.add(t.source);
+    allATAs.add(t.destination);
+  }
+  for (const a of allATAs) {
     if (accountKeys.some((k) => k.pubkey.toBase58() === a)) continue;
     accountKeys.push({ pubkey: new PublicKey(a) });
   }
@@ -577,9 +583,701 @@ await test('validateParsedSettlementTransaction: underpayment rejected', () => {
   assert(threw, 'Underpayment should be rejected');
 });
 
-  // ------------------------------------------------------------------
-  // Database-backed tests
-  // ------------------------------------------------------------------
+// ============================================================================
+// TASK 5: Regression tests using validateParsedSettlementTransaction
+// ============================================================================
+
+/** Builds a minimal quote for validator tests. */
+function makeValidatorQuote(buyerWallet: string, pubWallets: string[], amounts: string[]): any {
+  return {
+    id: 'q_val',
+    buyer_wallet: buyerWallet,
+    memo_expected: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    publisher_breakdown: pubWallets.map((pw, i) => ({
+      publisher_id: `pub_${i}`,
+      publisher_wallet: pw,
+      publisher_name: `Pub ${i}`,
+      documents: [
+        {
+          document_id: `doc_${i}`,
+          document_title: `Doc ${i}`,
+          chunk_ids: [`chk_${i}`],
+          amount_base_units: amounts[i],
+          amount_usdc: fromBaseUnits(BigInt(amounts[i])),
+        },
+      ],
+      amount_base_units: amounts[i],
+      amount_usdc: fromBaseUnits(BigInt(amounts[i])),
+    })),
+    total_base_units: amounts.reduce((sum, a) => sum + BigInt(a), BigInt(0)),
+  };
+}
+
+await test('validateParsedSettlementTransaction: valid payment to multiple publishers', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet1 = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+  const pubWallet2 = new PublicKey(crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).subarray(-32)).toBase58();
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet1, pubWallet2], ['20000', '30000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta1 = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet1)).toBase58();
+  const pubAta2 = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet2)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta1, amount: '20000', mint: DEVNET_USDC_MINT.toBase58() },
+      { source: buyerAta, destination: pubAta2, amount: '30000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta1, pre: '0', post: '20000' },
+      { accountIndex: 3, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta2, pre: '0', post: '30000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  const result = validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  assert.strictEqual(result.valid, true);
+  assert.strictEqual(result.totalBaseUnits, 50000n);
+  assert.strictEqual(result.breakdown.length, 2);
+});
+
+await test('validateParsedSettlementTransaction: multiple transfers to same publisher ATA', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  // Two transfers of 20000 and 30000 to the same publisher ATA = 50000 total
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '20000', mint: DEVNET_USDC_MINT.toBase58() },
+      { source: buyerAta, destination: pubAta, amount: '30000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  const result = validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  assert.strictEqual(result.valid, true);
+  assert.strictEqual(result.totalBaseUnits, 50000n);
+  assert.strictEqual(result.breakdown[0].received_amount, 50000n);
+});
+
+await test('validateParsedSettlementTransaction: overpayment rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '75000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '25000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '75000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'EXCESSIVE_TRANSFER');
+  }
+  assert(threw, 'Overpayment should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: wrong mint rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+  const badMint = new PublicKey(crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).subarray(-32)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: badMint },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: badMint, owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: badMint, owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'WRONG_SOURCE_MINT');
+  }
+  assert(threw, 'Wrong source mint should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: wrong source ATA (third-party funding) rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+  const attackerAta = new PublicKey(crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).subarray(-32)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: attackerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '100000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: attackerAta, pre: '50000', post: '0' },
+      { accountIndex: 3, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'THIRD_PARTY_FUNDING');
+  }
+  assert(threw, 'Third-party funding should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: wrong destination ATA (unexpected outflow) rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+  const wrongAta = new PublicKey(crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).subarray(-32)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: wrongAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '0' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'UNEXPECTED_OUTFLOW');
+  }
+  assert(threw, 'Unexpected outflow to non-priced destination should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: unexpected buyer inflow rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+  const attackerAta = new PublicKey(crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).subarray(-32)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+      { source: attackerAta, destination: buyerAta, amount: '10000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '60000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+      { accountIndex: 3, mint: DEVNET_USDC_MINT.toBase58(), owner: attackerAta, pre: '50000', post: '40000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'UNEXPECTED_INFLOW');
+  }
+  assert(threw, 'Unexpected buyer inflow should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: offsetting inflow/outflow attack rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+  const attackerAta = new PublicKey(crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).subarray(-32)).toBase58();
+
+  // Buyer sends 50000 to publisher, 10000 to attacker; attacker sends 10000 back.
+  // Net debit is still 50000 but there's an unexpected inflow + outflow.
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+      { source: buyerAta, destination: attackerAta, amount: '10000', mint: DEVNET_USDC_MINT.toBase58() },
+      { source: attackerAta, destination: buyerAta, amount: '10000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+      { accountIndex: 3, mint: DEVNET_USDC_MINT.toBase58(), owner: attackerAta, pre: '50000', post: '40000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert(
+      ['UNEXPECTED_OUTFLOW', 'UNEXPECTED_INFLOW'].includes(err.code),
+      `Expected UNEXPECTED_OUTFLOW or UNEXPECTED_INFLOW, got ${err.code}`
+    );
+  }
+  assert(threw, 'Offsetting inflow/outflow attack should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: incorrect buyer debit rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '60000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'PAYER_NOT_DEBITED_EXACT');
+  }
+  assert(threw, 'Incorrect buyer debit should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: duplicate balance-delta counting rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'TRANSFER_AMOUNT_MISMATCH');
+  }
+  assert(threw, 'Duplicate balance-delta counting should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: missing transaction metadata rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  delete (tx as any).meta;
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'TRANSACTION_NO_META');
+  }
+  assert(threw, 'Missing transaction metadata should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: missing block time rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: undefined,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'TRANSACTION_NO_BLOCK_TIME');
+  }
+  assert(threw, 'Missing block time should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: failed transaction rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: { InstructionError: 1 },
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'TRANSACTION_FAILED');
+  }
+  assert(threw, 'Failed transaction should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: missing memo rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: null,
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'MEMO_MISSING');
+  }
+  assert(threw, 'Missing memo should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: wrong memo rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:wrongdigest',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'MEMO_MISMATCH');
+  }
+  assert(threw, 'Wrong memo should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: expired quote rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+  // Expire the quote 10 minutes ago
+  quote.expires_at = new Date(Date.now() - 600000).toISOString();
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'QUOTE_EXPIRED');
+  }
+  assert(threw, 'Expired quote should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: wrong payer rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+  const wrongPayer = new PublicKey(crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).subarray(-32)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: wrongPayer,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'PAYER_MISMATCH');
+  }
+  assert(threw, 'Wrong payer should be rejected');
+});
+
+await test('validateParsedSettlementTransaction: BigInt serialization preserves large amounts', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  // Large amount: 1000 USDC = 1,000,000,000 base units
+  const largeAmount = '1000000000';
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], [largeAmount]);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: largeAmount, mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: DEVNET_USDC_MINT.toBase58(), owner: buyerAta, pre: '2000000000', post: '1000000000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: largeAmount },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  const result = validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  assert.strictEqual(result.valid, true);
+  assert.strictEqual(result.totalBaseUnits, BigInt(largeAmount));
+  assert.strictEqual(result.breakdown[0].received_amount, BigInt(largeAmount));
+  assert.strictEqual(result.breakdown[0].expected_amount, BigInt(largeAmount));
+});
+
+await test('validateParsedSettlementTransaction: invalid token-account metadata rejected', () => {
+  const buyerWallet = VALID_ADDRESS;
+  const pubWallet = '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin';
+
+  const quote = makeValidatorQuote(buyerWallet, [pubWallet], ['50000']);
+
+  const buyerAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(buyerWallet)).toBase58();
+  const pubAta = getAssociatedTokenAddressSync(DEVNET_USDC_MINT, new PublicKey(pubWallet)).toBase58();
+
+  // Token balance metadata with a non-USDC mint for the source account
+  const tx = makeParsedTx({
+    feePayer: buyerWallet,
+    buyerAta,
+    memoText: 'CITERAIL:QUOTE:q_val:nonce123:digest456',
+    transfers: [
+      { source: buyerAta, destination: pubAta, amount: '50000', mint: DEVNET_USDC_MINT.toBase58() },
+    ],
+    tokenBalances: [
+      { accountIndex: 1, mint: '11111111111111111111111111111112', owner: buyerAta, pre: '100000', post: '50000' },
+      { accountIndex: 2, mint: DEVNET_USDC_MINT.toBase58(), owner: pubAta, pre: '0', post: '50000' },
+    ],
+    blockTime: Math.floor(Date.now() / 1000) - 10,
+    err: null,
+  });
+
+  let threw = false;
+  try {
+    validateParsedSettlementTransaction(tx, quote, buyerWallet);
+  } catch (err: any) {
+    threw = true;
+    assert.strictEqual(err.code, 'WRONG_SOURCE_MINT');
+  }
+  assert(threw, 'Invalid token-account metadata should be rejected');
+});
 
   if (!HAS_DB) {
     skip('Quote pricing and memo binding', 'DATABASE_URL not configured');
@@ -943,16 +1641,6 @@ if (HAS_DB) {
     const digest1 = computeSourceDigest(hashes);
     const digest2 = computeSourceDigest([...hashes].reverse());
     assert.strictEqual(digest1, digest2, 'Digest must be order-independent');
-  });
-
-  // Test: Overpayment is accepted (total >= quote total).
-  await test('Overpayment: total transferred exceeds quote total', () => {
-    const quoteTotal = 100_000n;
-    const totalTransferred = 150_000n;
-    assert(
-      totalTransferred >= quoteTotal,
-      'Overpayment (150,000 >= 100,000) must satisfy total coverage check'
-    );
   });
 
   // Test: Underpayment is rejected (total < quote total).

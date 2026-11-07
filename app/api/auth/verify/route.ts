@@ -7,6 +7,7 @@ import {
   issueSessionToken,
   verifyWalletSignature,
 } from '@/lib/auth';
+import { getAuthSecret } from '@/lib/config';
 
 export const dynamic = 'force-dynamic';
 
@@ -113,6 +114,15 @@ export async function POST(req: Request) {
         { status: 401 }
       );
     }
+
+    // Resolve the signing secret BEFORE the nonce is burned.
+    //
+    // The nonce must be burned before a token is issued (otherwise two
+    // concurrent verifications of the same nonce could both receive a token),
+    // but a missing AUTH_SECRET is a server configuration problem, not a
+    // client error. Failing here means the challenge stays usable and the
+    // operator sees a clear message instead of an opaque 500.
+    getAuthSecret();
 
     // Burn the nonce. The UPDATE is conditional so that two concurrent
     // verifications cannot both succeed.
