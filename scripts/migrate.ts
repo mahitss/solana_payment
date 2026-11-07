@@ -12,6 +12,26 @@ async function migrate() {
 
   await withTransaction(async (client) => {
     // ------------------------------------------------------------------
+    // pgvector extension (idempotent)
+    // ------------------------------------------------------------------
+    const extRes = await client.query(
+      `CREATE EXTENSION IF NOT EXISTS vector`
+    );
+    console.log(`  pgvector extension: ${extRes.command}`);
+
+    // Verify the extension is available.
+    const verifyExt = await client.query(
+      `SELECT extname, extversion FROM pg_extension WHERE extname = 'vector'`
+    );
+    if (verifyExt.rows.length === 0) {
+      throw new Error(
+        'pgvector extension could not be enabled on this database. ' +
+        'Ensure your PostgreSQL provider supports pgvector.'
+      );
+    }
+    console.log(`  pgvector version: ${verifyExt.rows[0].extversion}`);
+
+    // ------------------------------------------------------------------
     // Publishers
     // ------------------------------------------------------------------
     await client.query(`
@@ -101,6 +121,47 @@ async function migrate() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_chunks_pub ON document_chunks(publisher_id);
     `);
+
+    // ------------------------------------------------------------------
+    // Document chunk embeddings (pgvector)
+    //
+    // Stores one vector per chunk per embedding model version. The source
+    // content SHA-256 hash binds each embedding to an exact chunk version,
+    // so stale embeddings can be detected and invalidated when chunks change.
+    // No raw licensed source content is stored here - only the hash and vector.
+    // ------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS document_chunk_embeddings (
+        id VARCHAR(64) PRIMARY KEY,
+        chunk_id VARCHAR(64) NOT NULL REFERENCES document_chunks(id) ON DELETE CASCADE,
+        document_id VARCHAR(64) NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        provider VARCHAR(50) NOT NULL,
+        model_id VARCHAR(100) NOT NULL,
+        model_digest VARCHAR(128),
+        dimensions INT NOT NULL,
+        source_hash VARCHAR(64) NOT NULL,
+        embedding vector NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // One embedding per chunk per model version.
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_embeddings_chunk_model
+        ON document_chunk_embeddings(chunk_id, provider, model_id);
+    `);
+
+    // Fast lookup by chunk for invalidation.
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_embeddings_chunk
+        ON document_chunk_embeddings(chunk_id);
+    `);
+
+    // Note: HNSW vector index is intentionally not created here because
+    // pgvector requires dimension-constrained vector columns (e.g. vector(768)).
+    // Dimensions are verified against the actual embedding model at runtime.
+    // Exact vector search is used initially; HNSW can be added later once
+    // dimensions are confirmed and performance measurements justify it.
 
     // ------------------------------------------------------------------
     // Payment quotes

@@ -149,6 +149,26 @@ export const config = {
   get challengeTtlSeconds(): number {
     return integer('AUTH_CHALLENGE_TTL_SECONDS', 300);
   },
+
+  /** Embedding provider identifier (default "ollama"). */
+  get embeddingProvider(): string {
+    return optional('EMBEDDING_PROVIDER', 'ollama');
+  },
+
+  /** Base URL for the Ollama embedding endpoint. */
+  get ollamaEmbeddingBaseUrl(): string {
+    return optional('OLLAMA_EMBEDDING_BASE_URL', 'http://127.0.0.1:11434');
+  },
+
+  /** Ollama embedding model identifier. */
+  get ollamaEmbeddingModel(): string {
+    return optional('OLLAMA_EMBEDDING_MODEL', 'embeddinggemma');
+  },
+
+  /** Expected embedding vector dimensions. */
+  get embeddingDimensions(): number {
+    return integer('EMBEDDING_DIMENSIONS', 768);
+  },
 };
 
 export type Config = typeof config;

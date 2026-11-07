@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { query, withTransaction } from './db';
 import { getOrCreatePublisher } from './publishers';
 import { chunkText, computeSha256, parseMarkdown, parsePdfBuffer } from './chunker';
+import { getEmbeddingProvider } from './embedding';
 
 export interface DocumentRecord {
   id: string;
@@ -15,6 +16,10 @@ export interface DocumentRecord {
   price_per_query_usdc: string;
   total_chunks: number;
   created_at: string;
+  /** Embedding generation status: 'pending', 'completed', 'failed', or 'skipped'. */
+  embeddingStatus: string;
+  /** Number of chunks with valid embeddings. */
+  embeddingCount: number;
 }
 
 export interface ChunkRecord {
@@ -127,6 +132,13 @@ export async function ingestDocument(params: {
       chunks.length,
     ]);
 
+    const chunkInserts: Array<{
+      id: string;
+      content: string;
+      contentHash: string;
+      tokenCount: number;
+    }> = [];
+
     for (const chunk of chunks) {
       const chunkId = `chk_${crypto.randomUUID()}`;
       await client.query(
@@ -145,6 +157,68 @@ export async function ingestDocument(params: {
           chunk.token_count,
         ]
       );
+      chunkInserts.push({
+        id: chunkId,
+        content: chunk.content,
+        contentHash: chunk.content_hash,
+        tokenCount: chunk.token_count,
+      });
+    }
+
+    // Generate embeddings for all chunks (best-effort; FTS remains available
+    // even if embedding generation fails).
+    const embeddingProvider = getEmbeddingProvider();
+    let embeddingStatus = 'skipped';
+    let embeddingCount = 0;
+
+    if (embeddingProvider) {
+      try {
+        const texts = chunkInserts.map((c) => c.content);
+        const vectors = await embeddingProvider.embedDocuments(texts);
+
+        const insertEmbeddingSql = `
+          INSERT INTO document_chunk_embeddings (
+            id, chunk_id, document_id, provider, model_id, model_digest,
+            dimensions, source_hash, embedding
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          ON CONFLICT (chunk_id, provider, model_id) DO UPDATE SET
+            document_id = EXCLUDED.document_id,
+            model_digest = EXCLUDED.model_digest,
+            dimensions = EXCLUDED.dimensions,
+            source_hash = EXCLUDED.source_hash,
+            embedding = EXCLUDED.embedding,
+            created_at = CURRENT_TIMESTAMP
+        `;
+
+        for (let i = 0; i < chunkInserts.length; i++) {
+          const chunk = chunkInserts[i];
+          const vector = vectors[i];
+          if (!vector) continue;
+
+          await client.query(insertEmbeddingSql, [
+            `emb_${crypto.randomUUID()}`,
+            chunk.id,
+            docId,
+            embeddingProvider.providerId,
+            embeddingProvider.modelId,
+            undefined, // model_digest not available from Ollama embed API
+            embeddingProvider.dimensions,
+            chunk.contentHash,
+            JSON.stringify(vector), // pgvector accepts text format '[0.1,0.2,...]'
+          ]);
+          embeddingCount++;
+        }
+
+        embeddingStatus = embeddingCount === chunkInserts.length ? 'completed' : 'partial';
+      } catch (embedErr) {
+        // Embedding failure must not fail document ingestion. FTS remains
+        // fully functional.
+        console.error(
+          `[documents] Embedding generation failed for document ${docId}:`,
+          embedErr instanceof Error ? embedErr.message : String(embedErr)
+        );
+        embeddingStatus = 'failed';
+      }
     }
 
     return {
@@ -159,6 +233,8 @@ export async function ingestDocument(params: {
       price_per_query_usdc: price.toFixed(6),
       total_chunks: chunks.length,
       created_at: docRes.rows[0].created_at,
+      embeddingStatus,
+      embeddingCount,
     };
   });
 }
