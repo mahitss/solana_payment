@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
 import { config } from '@/lib/config';
 import { SETTLEMENT_ASSET } from '@/lib/protocol';
+import { serializePublicCitations } from '@/lib/solana';
 
 export const dynamic = 'force-dynamic';
 
@@ -40,7 +41,7 @@ export async function GET(
       `SELECT r.id, r.quote_id, r.tx_signature, r.payer_wallet, r.total_amount_usdc,
               r.settlement_asset, r.settlement_amount_base_units,
               r.solana_slot, r.block_time, r.memo_verified, r.breakdown,
-              q.total_price_usdc as quote_total_usdc, q.memo_expected,
+              q.total_price_usdc as quote_total_usdc,
               e.ai_provider, e.ai_model, e.citations
        FROM settlement_receipts r
        JOIN payment_quotes q ON r.quote_id = q.id
@@ -80,7 +81,7 @@ export async function GET(
             amount_base_units: String(d.amount_base_units ?? '0'),
           })),
         })),
-        citations: parseMaybeJson(receipt.citations) || [],
+        citations: serializePublicCitations(receipt.citations),
         aiProvider: receipt.ai_provider,
         aiModel: receipt.ai_model,
         explorerUrl: `https://explorer.solana.com/tx/${receipt.tx_signature}?cluster=${config.solanaNetwork}`,

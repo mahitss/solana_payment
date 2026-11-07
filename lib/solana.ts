@@ -671,4 +671,56 @@ export async function verifySettlementTransaction(
   };
 }
 
+/**
+ * Serializes citations for public receipt responses using an explicit allowlist.
+ *
+ * Only safe citation metadata is exposed. Licensed source snippets, raw
+ * document content, buyer query text, generated answers, and any arbitrary
+ * extra fields persisted in JSONB are intentionally omitted.
+ *
+ * Supports both parsed JSONB objects and JSON-string inputs from PostgreSQL.
+ * Explicitly constructs each output object — no object spreading on untrusted
+ * or persisted data.
+ */
+export function serializePublicCitations(citations: any): Array<{
+  citation_index: number;
+  chunk_id: string;
+  document_title: string;
+  publisher_wallet: string;
+  publisher_name: string;
+  content_hash: string;
+}> {
+  const parsed =
+    typeof citations === 'string'
+      ? (() => {
+          try {
+            return JSON.parse(citations);
+          } catch {
+            return [];
+          }
+        })()
+      : citations;
+
+  if (!Array.isArray(parsed)) return [];
+
+  return parsed.map((c) => {
+    if (!c || typeof c !== 'object') return null;
+    return {
+      citation_index: c.citation_index,
+      chunk_id: c.chunk_id,
+      document_title: c.document_title,
+      publisher_wallet: c.publisher_wallet,
+      publisher_name: c.publisher_name,
+      content_hash: c.content_hash,
+    };
+  }) as Array<{
+    citation_index: number;
+    chunk_id: string;
+    document_title: string;
+    publisher_wallet: string;
+    publisher_name: string;
+    content_hash: string;
+  }>;
+}
+
 export { SETTLEMENT_ASSET };

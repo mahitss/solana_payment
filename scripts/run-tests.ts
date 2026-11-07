@@ -26,6 +26,7 @@ import {
   validateParsedSettlementTransaction,
   DEVNET_USDC_MINT,
   serializeBreakdown,
+  serializePublicCitations,
 } from '../lib/solana';
 import { buildGroundedPrompt, extractCitations } from '../lib/ai/provider';
 import { searchKnowledgeCollections } from '../lib/retrieval';
@@ -1439,6 +1440,148 @@ await test('serializeBreakdown: zero and fractional USDC formatting', () => {
   assert.doesNotThrow(() => JSON.stringify(serialized));
 });
 
+// ============================================================================
+// Public citation serializer tests
+// ============================================================================
+
+await test('serializePublicCitations: allowlists safe citation fields', () => {
+  const citations = [
+    {
+      citation_index: 1,
+      chunk_id: 'chk_1',
+      document_title: 'Doc One',
+      publisher_wallet: '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
+      publisher_name: 'Pub One',
+      content_hash: 'abc123def456',
+      snippet: 'This is licensed source content that must not be exposed',
+      source_content: 'Full raw source content',
+      query_text: 'buyer query text',
+      generated_answer: 'AI generated answer',
+      extra_field: 'should not appear',
+    },
+  ];
+
+  const serialized = serializePublicCitations(citations) as any;
+
+  assert.strictEqual(serialized.length, 1);
+  assert.strictEqual(serialized[0].citation_index, 1);
+  assert.strictEqual(serialized[0].chunk_id, 'chk_1');
+  assert.strictEqual(serialized[0].document_title, 'Doc One');
+  assert.strictEqual(serialized[0].publisher_wallet, '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin');
+  assert.strictEqual(serialized[0].publisher_name, 'Pub One');
+  assert.strictEqual(serialized[0].content_hash, 'abc123def456');
+
+  // Forbidden fields must not be present
+  assert.strictEqual(serialized[0].snippet, undefined);
+  assert.strictEqual(serialized[0].source_content, undefined);
+  assert.strictEqual(serialized[0].query_text, undefined);
+  assert.strictEqual(serialized[0].generated_answer, undefined);
+  assert.strictEqual(serialized[0].extra_field, undefined);
+});
+
+await test('serializePublicCitations: JSON string input', () => {
+  const jsonString = JSON.stringify([
+    {
+      citation_index: 2,
+      chunk_id: 'chk_2',
+      document_title: 'Doc Two',
+      publisher_wallet: '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
+      publisher_name: 'Pub Two',
+      content_hash: 'def789ghi012',
+      snippet: 'snippet content',
+    },
+  ]);
+
+  const serialized = serializePublicCitations(jsonString) as any;
+
+  assert.strictEqual(serialized.length, 1);
+  assert.strictEqual(serialized[0].citation_index, 2);
+  assert.strictEqual(serialized[0].chunk_id, 'chk_2');
+  assert.strictEqual(serialized[0].document_title, 'Doc Two');
+  assert.strictEqual(serialized[0].content_hash, 'def789ghi012');
+  assert.strictEqual(serialized[0].snippet, undefined);
+});
+
+await test('serializePublicCitations: null and undefined input', () => {
+  assert.deepStrictEqual(serializePublicCitations(null), []);
+  assert.deepStrictEqual(serializePublicCitations(undefined), []);
+});
+
+await test('serializePublicCitations: non-array input', () => {
+  assert.deepStrictEqual(serializePublicCitations({}), []);
+  assert.deepStrictEqual(serializePublicCitations('not json'), []);
+});
+
+await test('serializePublicCitations: multiple citations with nested fields', () => {
+  const citations = [
+    {
+      citation_index: 1,
+      chunk_id: 'chk_1',
+      document_title: 'Doc One',
+      publisher_wallet: 'wallet_1',
+      publisher_name: 'Pub One',
+      content_hash: 'hash1',
+      snippet: 'licensed snippet 1',
+      _internal: 'hidden',
+    },
+    {
+      citation_index: 2,
+      chunk_id: 'chk_2',
+      document_title: 'Doc Two',
+      publisher_wallet: 'wallet_2',
+      publisher_name: 'Pub Two',
+      content_hash: 'hash2',
+      source_content: 'raw content',
+      nested: { secret: 'value' },
+    },
+  ];
+
+  const serialized = serializePublicCitations(citations) as any;
+
+  assert.strictEqual(serialized.length, 2);
+  assert.strictEqual(serialized[0].citation_index, 1);
+  assert.strictEqual(serialized[1].citation_index, 2);
+  assert.strictEqual(serialized[0].snippet, undefined);
+  assert.strictEqual(serialized[0]._internal, undefined);
+  assert.strictEqual(serialized[1].source_content, undefined);
+  assert.strictEqual(serialized[1].nested, undefined);
+});
+
+// ============================================================================
+// Public receipt privacy regression test
+// ============================================================================
+
+await test('Public receipt response contains no snippet/source_content/query_text/generated_answer', () => {
+  // This test verifies the serializePublicCitations helper produces output
+  // that contains none of the forbidden fields, simulating the public receipt
+  // response serialization used by app/api/receipts/[sig]/route.ts.
+  const citations = [
+    {
+      citation_index: 1,
+      chunk_id: 'chk_1',
+      document_title: 'Doc One',
+      publisher_wallet: '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
+      publisher_name: 'Pub One',
+      content_hash: 'abc123',
+      snippet: 'SENSITIVE LICENSED CONTENT',
+      source_content: 'RAW SOURCE CONTENT',
+      query_text: 'buyer query text',
+      generated_answer: 'AI generated answer',
+    },
+  ];
+
+  const serialized = serializePublicCitations(citations);
+  const json = JSON.stringify({ receipt: { citations: serialized } });
+
+  assert(!json.includes('snippet'), 'Public response must not contain snippet');
+  assert(!json.includes('source_content'), 'Public response must not contain source_content');
+  assert(!json.includes('query_text'), 'Public response must not contain query_text');
+  assert(!json.includes('generated_answer'), 'Public response must not contain generated_answer');
+  assert(json.includes('chk_1'), 'Public response must retain chunk_id');
+  assert(json.includes('Doc One'), 'Public response must retain document_title');
+  assert(json.includes('abc123'), 'Public response must retain content_hash');
+});
+
   if (!HAS_DB) {
     skip('Quote pricing and memo binding', 'DATABASE_URL not configured');
     skip('Quote status transitions to REDEEMED', 'DATABASE_URL not configured');
@@ -1773,72 +1916,12 @@ if (HAS_DB) {
     assert.strictEqual(quote.total_base_units, 120_000n, '0.05 + 0.03 + 0.04 = 0.12 USDC = 120,000 base units');
   });
 
-  // Test: Modified chunk before payment — SHA-256 mismatch detected.
-  await test('Modified chunk content produces different SHA-256 hash', () => {
-    const original = 'Original chunk content';
-    const modified = 'Modified chunk content';
-    assert.notStrictEqual(
-      computeSha256(original),
-      computeSha256(modified),
-      'Modified content must produce different hash'
-    );
-  });
-
-  // Test: Missing source chunk — count mismatch detected.
-  await test('Missing source chunk: chunk count mismatch', () => {
-    const quoteChunkIds = ['chk_1', 'chk_2', 'chk_3'];
-    const retrievedChunkIds = ['chk_1', 'chk_2'];
-    assert.notStrictEqual(
-      retrievedChunkIds.length,
-      quoteChunkIds.length,
-      'Missing chunk must be detected by count mismatch'
-    );
-  });
-
   // Test: Reordered source chunks — digest is order-independent.
   await test('Reordered source chunks produce same digest', () => {
     const hashes = ['aaa', 'bbb', 'ccc'];
     const digest1 = computeSourceDigest(hashes);
     const digest2 = computeSourceDigest([...hashes].reverse());
     assert.strictEqual(digest1, digest2, 'Digest must be order-independent');
-  });
-
-  // Test: Underpayment is rejected (total < quote total).
-  await test('Underpayment: total transferred below quote total', () => {
-    const quoteTotal = 100_000n;
-    const totalTransferred = 50_000n;
-    assert(
-      totalTransferred < quoteTotal,
-      'Underpayment (50,000 < 100,000) must fail total coverage check'
-    );
-  });
-
-  // Test: Wrong source token account — transfer source != buyer ATA is rejected.
-  await test('Wrong source ATA: transfer from non-buyer ATA is rejected', () => {
-    const buyerAta = 'BuyerATAStr';
-    const transferSource = 'SomeOtherATAStr';
-    assert.notStrictEqual(
-      transferSource,
-      buyerAta,
-      'Transfer source must match buyer ATA'
-    );
-  });
-
-  // Test: Wrong recipient account — transfer to non-priced destination is rejected.
-  await test('Wrong recipient: transfer to non-priced destination is rejected', () => {
-    const pricedDestinations = new Set(['PublisherAATA', 'PublisherBATA']);
-    const transferDestination = 'RandomWalletATA';
-    assert(
-      !pricedDestinations.has(transferDestination),
-      'Transfer to non-priced destination must be rejected'
-    );
-  });
-
-  // Test: Wrong token mint — non-USDC mint is rejected.
-  await test('Wrong mint: non-USDC mint transfer is rejected', () => {
-    const usdcMint = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
-    const transferMint = 'SomeOtherMintAddress1111111111111111111111111';
-    assert.notStrictEqual(transferMint, usdcMint, 'Non-USDC mint must be rejected');
   });
 
   // Test: Duplicate settlement request — replay protection.
