@@ -211,6 +211,26 @@ function getTokenAccountDelta(
 }
 
 /**
+ * Serializes a validated settlement breakdown for JSON persistence and public
+ * receipt responses. All BigInt base-unit amounts are converted to decimal
+ * integer strings so JSON.stringify can never throw on monetary values.
+ *
+ * Internal verified settlement values remain BigInt; this function only
+ * produces the serialized representation used for storage and API responses.
+ */
+export function serializeBreakdown(breakdown: ValidatedSettlement['breakdown']) {
+  return breakdown.map((b) => ({
+    ...b,
+    expected_amount: String(b.expected_amount),
+    received_amount: String(b.received_amount),
+    documents: b.documents.map((d) => ({
+      ...d,
+      amount_base_units: String(d.amount_base_units),
+    })),
+  }));
+}
+
+/**
  * Removes the wallet-level balance fallback as an independent source of
  * payment proof. All payment verification now uses per-token-account balance
  * deltas from transaction metadata.
@@ -569,17 +589,7 @@ export async function verifySettlementTransaction(
       validated.totalBaseUnits,
       tx.slot,
       new Date(tx.blockTime! * 1000).toISOString(),
-      JSON.stringify(
-        validated.breakdown.map((b: any) => ({
-          ...b,
-          expected_amount: String(b.expected_amount),
-          received_amount: String(b.received_amount),
-          documents: b.documents.map((d: any) => ({
-            ...d,
-            amount_base_units: String(d.amount_base_units),
-          })),
-        }))
-      ),
+      JSON.stringify(serializeBreakdown(validated.breakdown)),
     ]);
 
     // Mark the quote redeemed. The conditional UPDATE means two concurrent
@@ -656,15 +666,7 @@ export async function verifySettlementTransaction(
     solana_slot: Number(receipt.solana_slot),
     block_time: receipt.block_time,
     memo_verified: receipt.memo_verified,
-    breakdown: validated.breakdown.map((b: any) => ({
-      ...b,
-      expected_amount: String(b.expected_amount),
-      received_amount: String(b.received_amount),
-      documents: b.documents.map((d: any) => ({
-        ...d,
-        amount_base_units: String(d.amount_base_units),
-      })),
-    })),
+    breakdown: serializeBreakdown(validated.breakdown),
     created_at: receipt.created_at,
   };
 }

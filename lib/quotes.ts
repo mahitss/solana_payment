@@ -315,5 +315,88 @@ export async function markQuoteExpired(quoteId: string): Promise<void> {
   );
 }
 
+/**
+ * Validates that an ordered set of quote source snapshots matches a quote's
+ * matched_chunk_ids exactly. Applied both before initial settlement and before
+ * answer generation on redeemed-quote retries.
+ *
+ * Checks:
+ *   - Snapshot count equals matched chunk count.
+ *   - Chunk IDs match the quote in exact order.
+ *   - Ordinals are contiguous and begin at zero.
+ *   - Chunk IDs are unique (no duplicates).
+ *   - Content hashes match actual content (recalculated SHA-256).
+ *   - Combined digest matches the quote memo.
+ *
+ * Never uses live document chunks as a fallback; only immutable snapshots are
+ * accepted.
+ *
+ * Throws an Error describing the first failure found.
+ */
+export function validateQuoteSnapshotSet(
+  quote: PaymentQuote,
+  snapshots: Array<{
+    ordinal: number;
+    chunk_id: string;
+    source_content: string;
+    source_sha256: string;
+  }>
+): void {
+  const matchedIds = quote.matched_chunk_ids;
+
+  // Snapshot count must equal matched chunk count.
+  if (snapshots.length !== matchedIds.length) {
+    throw new Error(
+      `Snapshot chunk count ${snapshots.length} does not match matched chunk count ${matchedIds.length}.`
+    );
+  }
+
+  // Chunk IDs must match the quote in exact order.
+  for (let i = 0; i < snapshots.length; i++) {
+    if (snapshots[i].chunk_id !== matchedIds[i]) {
+      throw new Error(
+        `Snapshot chunk order mismatch at position ${i}: expected ${matchedIds[i]}, got ${snapshots[i].chunk_id}.`
+      );
+    }
+  }
+
+  // Chunk IDs must be unique.
+  const uniqueIds = new Set(snapshots.map((s) => s.chunk_id));
+  if (uniqueIds.size !== snapshots.length) {
+    throw new Error('Duplicate snapshot chunk IDs detected.');
+  }
+
+  // Ordinals must be contiguous and begin at zero.
+  const ordinals = snapshots.map((s) => s.ordinal).sort((a, b) => a - b);
+  for (let i = 0; i < ordinals.length; i++) {
+    if (ordinals[i] !== i) {
+      throw new Error(
+        `Snapshot ordinal order is inconsistent: expected ${i} at position ${i}, got ${ordinals[i]}.`
+      );
+    }
+  }
+
+  // Each snapshot's SHA-256 hash must match recalculated content hash.
+  for (const snapshot of snapshots) {
+    const recalculatedHash = computeSha256(snapshot.source_content);
+    if (recalculatedHash !== snapshot.source_sha256) {
+      throw new Error(
+        `Source integrity check failed for chunk ${snapshot.chunk_id}: content has been modified.`
+      );
+    }
+  }
+
+  // Combined source digest must match the memo digest.
+  const recalculatedDigest = computeSourceDigest(
+    snapshots.map((s) => s.source_sha256)
+  );
+  const memoDigest = quote.memo_expected.split(':').pop() || '';
+  if (recalculatedDigest !== memoDigest) {
+    throw new Error(
+      'Source digest mismatch: purchased content does not match the quoted sources.'
+    );
+  }
+}
+
 /** Re-exported for convenience so callers do not need two imports. */
 export { SETTLEMENT_ASSET, computeSha256 };

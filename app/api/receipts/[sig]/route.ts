@@ -9,6 +9,19 @@ export const dynamic = 'force-dynamic';
  * Public verifier. Anyone holding a transaction signature can audit the
  * settlement: the payment is provable on-chain, so the receipt is public
  * information by design.
+ *
+ * The public receipt deliberately does NOT expose:
+ *   - Paid source snippets or raw source content (licensed passages).
+ *   - The buyer's original query text.
+ *   - Any field that exposes licensed or untrusted source material.
+ *
+ * Keep useful audit information:
+ *   - Transaction signature, payer/publisher wallet addresses.
+ *   - Settlement asset, exact total and publisher payout amounts.
+ *   - Publisher/document attribution metadata.
+ *   - Source content hashes and citation identifiers.
+ *   - Solana explorer URL.
+ *   - Verified settlement status.
  */
 export async function GET(
   req: Request,
@@ -24,8 +37,11 @@ export async function GET(
     }
 
     const receiptRes = await query(
-      `SELECT r.*, q.query_text, q.total_price_usdc as quote_total_usdc, q.memo_expected,
-              e.ai_provider, e.ai_model, e.citations, e.generated_answer
+      `SELECT r.id, r.quote_id, r.tx_signature, r.payer_wallet, r.total_amount_usdc,
+              r.settlement_asset, r.settlement_amount_base_units,
+              r.solana_slot, r.block_time, r.memo_verified, r.breakdown,
+              q.total_price_usdc as quote_total_usdc, q.memo_expected,
+              e.ai_provider, e.ai_model, e.citations
        FROM settlement_receipts r
        JOIN payment_quotes q ON r.quote_id = q.id
        LEFT JOIN query_executions e ON e.receipt_id = r.id
@@ -55,7 +71,6 @@ export async function GET(
         slot: Number(receipt.solana_slot),
         blockTime: receipt.block_time,
         memoVerified: receipt.memo_verified,
-        memoExpected: receipt.memo_expected,
         breakdown: breakdown.map((b: any) => ({
           ...b,
           expected_amount: String(b.expected_amount ?? '0'),
@@ -65,7 +80,6 @@ export async function GET(
             amount_base_units: String(d.amount_base_units ?? '0'),
           })),
         })),
-        queryText: receipt.query_text,
         citations: parseMaybeJson(receipt.citations) || [],
         aiProvider: receipt.ai_provider,
         aiModel: receipt.ai_model,

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getQuote, getQuoteSources } from '@/lib/quotes';
+import { getQuote, getQuoteSources, validateQuoteSnapshotSet } from '@/lib/quotes';
 import { verifySettlementTransaction, SolanaVerificationError } from '@/lib/solana';
 import { getActiveAIProvider } from '@/lib/ai/provider';
 import { query } from '@/lib/db';
@@ -129,38 +129,16 @@ export async function POST(req: Request) {
         );
       }
 
-      // Verify snapshot chunk IDs match the quote exactly, in order.
-      const snapshotChunkIds = snapshots.map((s) => s.chunk_id);
-      for (let i = 0; i < snapshotChunkIds.length; i++) {
-        if (snapshotChunkIds[i] !== quote.matched_chunk_ids[i]) {
-          return NextResponse.json(
-            {
-              success: false,
-              error: `Snapshot chunk order mismatch at position ${i}: expected ${quote.matched_chunk_ids[i]}, got ${snapshotChunkIds[i]}. No settlement was recorded.`,
-            },
-            { status: 409 }
-          );
-        }
-      }
-
-      // Reject duplicate snapshot chunk IDs.
-      const uniqueSnapshotChunkIds = new Set(snapshotChunkIds);
-      if (uniqueSnapshotChunkIds.size !== snapshotChunkIds.length) {
+      // Validate snapshot set using shared helper (count, order, ordinals,
+      // duplicates, content hashes, combined digest).
+      try {
+        validateQuoteSnapshotSet(quote, snapshots as any);
+      } catch (err: any) {
         return NextResponse.json(
-          {
-            success: false,
-            error: 'Duplicate snapshot chunk IDs detected. No settlement was recorded.',
-          },
+          { success: false, error: err.message },
           { status: 409 }
         );
       }
-
-      const snapshotIntegrity = snapshots.map((s) => ({
-        content: s.source_content,
-        content_hash: s.source_sha256,
-        id: s.chunk_id,
-      }));
-      validateSnapshotIntegrity(snapshotIntegrity, quote.memo_expected);
 
       const aiChunks = snapshots.map((s) => ({
         id: s.chunk_id,
@@ -196,10 +174,7 @@ export async function POST(req: Request) {
     }
 
     // TASK 3: Source Integrity BEFORE settlement — verify exact purchased
-    // chunks from the immutable snapshot before allowing payment. Check every
-    // chunk's SHA-256 hash, verify the combined source digest, ensure
-    // retrieved chunk IDs match the quote exactly, and preserve deterministic
-    // source order.
+    // chunks from the immutable snapshot before allowing payment.
     const snapshots = await getQuoteSources(quote.id);
     if (snapshots.length === 0) {
       return NextResponse.json(
@@ -212,83 +187,13 @@ export async function POST(req: Request) {
       );
     }
 
-    // Verify snapshot count matches the quote's matched chunks.
-    if (snapshots.length !== quote.matched_chunk_ids.length) {
+    // Validate snapshot set using shared helper (count, order, ordinals,
+    // duplicates, content hashes, combined digest).
+    try {
+      validateQuoteSnapshotSet(quote, snapshots as any);
+    } catch (err: any) {
       return NextResponse.json(
-        {
-          success: false,
-          error:
-            'Snapshot chunk count does not match the quoted sources. No settlement was recorded.',
-        },
-        { status: 409 }
-      );
-    }
-
-    // Verify snapshot chunk IDs match the quote exactly, in order.
-    const snapshotChunkIds = snapshots.map((s) => s.chunk_id);
-    for (let i = 0; i < snapshotChunkIds.length; i++) {
-      if (snapshotChunkIds[i] !== quote.matched_chunk_ids[i]) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: `Snapshot chunk order mismatch at position ${i}: expected ${quote.matched_chunk_ids[i]}, got ${snapshotChunkIds[i]}. No settlement was recorded.`,
-          },
-          { status: 409 }
-        );
-      }
-    }
-
-    // Reject duplicate snapshot chunk IDs.
-    const uniqueSnapshotChunkIds = new Set(snapshotChunkIds);
-    if (uniqueSnapshotChunkIds.size !== snapshotChunkIds.length) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: 'Duplicate snapshot chunk IDs detected. No settlement was recorded.',
-        },
-        { status: 409 }
-      );
-    }
-
-    // Verify snapshot ordinal order is deterministic (0, 1, 2, ...).
-    const ordinals = snapshots.map((s) => s.ordinal).sort((a, b) => a - b);
-    for (let i = 0; i < ordinals.length; i++) {
-      if (ordinals[i] !== i) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: 'Snapshot ordinal order is inconsistent. No settlement was recorded.',
-          },
-          { status: 409 }
-        );
-      }
-    }
-
-    // Verify each snapshot's SHA-256 hash against its stored hash.
-    for (const snapshot of snapshots) {
-      const recalculatedHash = computeSha256(snapshot.source_content);
-      if (recalculatedHash !== snapshot.source_sha256) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: `Source integrity check failed for snapshot chunk ${snapshot.chunk_id}: content has been modified.`,
-          },
-          { status: 409 }
-        );
-      }
-    }
-
-    // Verify the combined source digest against the memo.
-    const recalculatedDigest = computeSourceDigest(
-      snapshots.map((s) => s.source_sha256)
-    );
-    const memoDigest = quote.memo_expected.split(':').pop() || '';
-    if (recalculatedDigest !== memoDigest) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: 'Source digest mismatch: purchased content does not match the quoted sources.',
-        },
+        { success: false, error: err.message },
         { status: 409 }
       );
     }
