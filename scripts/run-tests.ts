@@ -1657,7 +1657,8 @@ function makeTestEmbeddingProvider(dimensions: number = 3): OllamaEmbeddingProvi
     'http://127.0.0.1:11434',
     'embeddinggemma',
     dimensions,
-    TEST_MODEL_DIGEST
+    TEST_MODEL_DIGEST,
+    true  // skipRevalidation: directly-constructed test instance
   );
 }
 
@@ -3967,57 +3968,59 @@ await test('fromBaseUnits: exact decimal string', () => {
 
 if (HAS_DB) {
   // Test: createPaymentQuote with invalid price fails closed.
-  await test('createPaymentQuote: invalid price fails closed', async () => {
-    // A real eligible fixture is priced normally in the database; the
-    // ChunkRecord carries the corrupt price so this exercises the
-    // quote-builder's own fail-closed price validation.
-    const specs: QuoteFixtureSpec[] = [
-      {
-        wallet: VALID_ADDRESS,
-        publisherName: 'Bad Price',
-        title: 'Bad Price Doc',
-        price: '0.050000',
-        recordPrice: 'invalid',
-        content: 'content',
-        docId: uniqueId('doc_badprice'),
-        chunkId: uniqueId('chk_badprice'),
-      },
-    ];
-    const chunks = await insertQuoteFixtures(specs);
+  // Price validation now applies to DB-authoritative prices. A non-numeric
+  // price can never exist in the NUMERIC(10,6) documents column, so this
+  // exercises the parseNumericPrice guard directly.
+  await test('createPaymentQuote: invalid price fails closed', () => {
+    let threw = false;
     try {
-      let threw = false;
-      try {
-        await createPaymentQuote('bad price query', chunks);
-      } catch (err: any) {
-        threw = true;
-        assert(
-          !(err instanceof IneligibleSourceError),
-          'The invalid price must be rejected by pricing, not eligibility'
-        );
-        assert(err.message.includes('Invalid'), 'Should throw on invalid price');
-      }
-      assert(threw, 'Should throw on invalid price');
-    } finally {
-      await removeQuoteFixtures(specs);
+      parseNumericPrice('invalid');
+    } catch (err: any) {
+      threw = true;
+      assert(err.message.includes('Invalid'), 'Expected invalid price error');
     }
+    assert(threw, 'parseNumericPrice must reject non-numeric price');
   });
 
   // Test: createPaymentQuote with zero price fails closed.
+  // Inserts a document with price 0 directly into the DB (bypassing
+  // ingestDocument validation) and verifies the quote builder rejects it.
   await test('createPaymentQuote: zero price fails closed', async () => {
-    const specs: QuoteFixtureSpec[] = [
-      {
-        wallet: VALID_ADDRESS,
-        publisherName: 'Zero Price',
-        title: 'Zero Price Doc',
-        price: '0.050000',
-        recordPrice: '0',
-        content: 'content',
-        docId: uniqueId('doc_zero'),
-        chunkId: uniqueId('chk_zero'),
-      },
-    ];
-    const chunks = await insertQuoteFixtures(specs);
+    const wallet = makeWallet().address;
+    const docId = uniqueId('doc_zero_price');
+    const chunkId = uniqueId('chk_zero_price');
+    const content = 'Zero price content';
     try {
+      await query(
+        'INSERT INTO publishers (id, wallet_address, name, status, verified_at) VALUES ($1, $2, $3, $4, NOW())',
+        [uniqueId('pub_zero'), wallet, 'Zero Price Pub', 'active']
+      );
+      const pubRes = await query<{ id: string }>(
+        'SELECT id FROM publishers WHERE wallet_address = $1', [wallet]
+      );
+      await query(
+        'INSERT INTO documents (id, publisher_id, title, file_type, content_hash, license_type, price_per_query_usdc, total_chunks, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+        [docId, pubRes.rows[0].id, 'Zero Price Doc', 'md', computeSha256(content), 'query_royalty_v1', '0', 1, 'active']
+      );
+      await query(
+        'INSERT INTO document_chunks (id, document_id, publisher_id, chunk_index, content, content_hash, token_count, search_vector) VALUES ($1, $2, $3, $4, $5, $6, $7, to_tsvector($8, $5))',
+        [chunkId, docId, pubRes.rows[0].id, 0, content, computeSha256(content), 10, 'english']
+      );
+
+      const chunks: ChunkRecord[] = [{
+        id: chunkId,
+        document_id: docId,
+        publisher_id: pubRes.rows[0].id,
+        publisher_wallet: wallet,
+        publisher_name: 'Zero Price Pub',
+        document_title: 'Zero Price Doc',
+        price_per_query_usdc: '0',
+        chunk_index: 0,
+        content,
+        content_hash: computeSha256(content),
+        token_count: 10,
+      }];
+
       let threw = false;
       try {
         await createPaymentQuote('zero price query', chunks);
@@ -4025,31 +4028,55 @@ if (HAS_DB) {
         threw = true;
         assert(
           /price|amount/i.test(err.message),
-          `Expected a price-validation error, got: ${err.message}`
+          'Expected a price-validation error, got: ' + err.message
         );
       }
       assert(threw, 'Should throw on zero price');
     } finally {
-      await removeQuoteFixtures(specs);
+      await query('DELETE FROM documents WHERE id = $1', [docId]);
+      await query('DELETE FROM document_chunks WHERE id = $1', [chunkId]);
+      await query('DELETE FROM publishers WHERE wallet_address = $1', [wallet]);
     }
   });
 
   // Test: createPaymentQuote with excessive price fails closed.
+  // Inserts a document with price above MAX_PRICE_USDC directly into the DB.
   await test('createPaymentQuote: excessive price fails closed', async () => {
-    const specs: QuoteFixtureSpec[] = [
-      {
-        wallet: VALID_ADDRESS,
-        publisherName: 'Excess Price',
-        title: 'Excess Price Doc',
-        price: '0.050000',
-        recordPrice: '2000',
-        content: 'content',
-        docId: uniqueId('doc_excess'),
-        chunkId: uniqueId('chk_excess'),
-      },
-    ];
-    const chunks = await insertQuoteFixtures(specs);
+    const wallet = makeWallet().address;
+    const docId = uniqueId('doc_excess_price');
+    const chunkId = uniqueId('chk_excess_price');
+    const content = 'Excess price content';
     try {
+      await query(
+        'INSERT INTO publishers (id, wallet_address, name, status, verified_at) VALUES ($1, $2, $3, $4, NOW())',
+        [uniqueId('pub_excess'), wallet, 'Excess Price Pub', 'active']
+      );
+      const pubRes = await query<{ id: string }>(
+        'SELECT id FROM publishers WHERE wallet_address = $1', [wallet]
+      );
+      await query(
+        'INSERT INTO documents (id, publisher_id, title, file_type, content_hash, license_type, price_per_query_usdc, total_chunks, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+        [docId, pubRes.rows[0].id, 'Excess Price Doc', 'md', computeSha256(content), 'query_royalty_v1', '2000', 1, 'active']
+      );
+      await query(
+        'INSERT INTO document_chunks (id, document_id, publisher_id, chunk_index, content, content_hash, token_count, search_vector) VALUES ($1, $2, $3, $4, $5, $6, $7, to_tsvector($8, $5))',
+        [chunkId, docId, pubRes.rows[0].id, 0, content, computeSha256(content), 10, 'english']
+      );
+
+      const chunks: ChunkRecord[] = [{
+        id: chunkId,
+        document_id: docId,
+        publisher_id: pubRes.rows[0].id,
+        publisher_wallet: wallet,
+        publisher_name: 'Excess Price Pub',
+        document_title: 'Excess Price Doc',
+        price_per_query_usdc: '2000',
+        chunk_index: 0,
+        content,
+        content_hash: computeSha256(content),
+        token_count: 10,
+      }];
+
       let threw = false;
       try {
         await createPaymentQuote('excess price query', chunks);
@@ -4057,45 +4084,29 @@ if (HAS_DB) {
         threw = true;
         assert(
           /price|amount|maximum/i.test(err.message),
-          `Expected a maximum-price error, got: ${err.message}`
+          'Expected a maximum-price error, got: ' + err.message
         );
       }
       assert(threw, 'Should throw on excessive price');
     } finally {
-      await removeQuoteFixtures(specs);
+      await query('DELETE FROM documents WHERE id = $1', [docId]);
+      await query('DELETE FROM document_chunks WHERE id = $1', [chunkId]);
+      await query('DELETE FROM publishers WHERE wallet_address = $1', [wallet]);
     }
   });
 
   // Test: Price with more than 6 decimal places fails closed.
-  await test('createPaymentQuote: too many decimal places fails closed', async () => {
-    const specs: QuoteFixtureSpec[] = [
-      {
-        wallet: VALID_ADDRESS,
-        publisherName: 'Decimal Price',
-        title: 'Decimal Price Doc',
-        price: '0.050000',
-        recordPrice: '0.0500001',
-        content: 'content',
-        docId: uniqueId('doc_decimals'),
-        chunkId: uniqueId('chk_decimals'),
-      },
-    ];
-    const chunks = await insertQuoteFixtures(specs);
+  // A 7-decimal price can never exist in NUMERIC(10,6), so this exercises
+  // the parseNumericPrice guard directly.
+  await test('createPaymentQuote: too many decimal places fails closed', () => {
+    let threw = false;
     try {
-      let threw = false;
-      try {
-        await createPaymentQuote('decimal price query', chunks);
-      } catch (err: any) {
-        threw = true;
-        assert(
-          /decimal/i.test(err.message),
-          `Expected a decimal-places error, got: ${err.message}`
-        );
-      }
-      assert(threw, 'Should throw on too many decimal places');
-    } finally {
-      await removeQuoteFixtures(specs);
+      parseNumericPrice('0.0500001');
+    } catch (err: any) {
+      threw = true;
+      assert(/decimal/i.test(err.message), 'Expected decimal-places error');
     }
+    assert(threw, 'parseNumericPrice must reject too many decimal places');
   });
 
   // Test: getQuoteSources returns snapshots in ordinal order.
@@ -4807,6 +4818,128 @@ if (HAS_DB) {
       assert(threw, 'A live verification attempt must not silently succeed');
     });
   }
+
+  // ------------------------------------------------------------------
+  // Mission 003.2.1: Model digest consistency tests
+  // ------------------------------------------------------------------
+
+  await test('Embedding provider: revalidateModelDigest passes when digest matches', async () => {
+    setMockFetch(
+      makeEmbeddingMockFetch({
+        tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+      })
+    );
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      await provider.revalidateModelDigest();
+      // No throw means digest matches.
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding provider: revalidateModelDigest throws MODEL_IDENTITY_CHANGED when digest drifts', async () => {
+    setMockFetch(
+      makeEmbeddingMockFetch({
+        tagsModels: [{ name: 'embeddinggemma', digest: 'bb'.repeat(32) }],
+      })
+    );
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.revalidateModelDigest();
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err.code, 'MODEL_IDENTITY_CHANGED');
+      }
+      assert(threw, 'revalidateModelDigest must throw on digest drift');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding provider: revalidateModelDigest throws MODEL_DIGEST_UNAVAILABLE when endpoint unreachable', async () => {
+    setMockFetch(async () => {
+      throw new Error('connect ECONNREFUSED 127.0.0.1:11434');
+    });
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.revalidateModelDigest();
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err.code, 'MODEL_DIGEST_UNAVAILABLE');
+      }
+      assert(threw, 'revalidateModelDigest must throw on endpoint failure');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding provider: embedBatch revalidates before inference and rejects drift', async () => {
+    setMockFetch(
+      makeEmbeddingMockFetch({
+        tagsModels: [{ name: 'embeddinggemma', digest: 'cc'.repeat(32) }],
+        embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+      })
+    );
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.embedDocuments(['hello']);
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err.code, 'MODEL_IDENTITY_CHANGED');
+      }
+      assert(threw, 'embedDocuments must reject when model digest drifts');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding provider: embedQuery revalidates before inference', async () => {
+    setMockFetch(
+      makeEmbeddingMockFetch({
+        tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+        embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+      })
+    );
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      const vector = await provider.embedQuery('hello');
+      assert.strictEqual(vector.length, 3);
+    } finally {
+      restoreFetch();
+    }
+  });
 
   // ------------------------------------------------------------------
   // Cleanup

@@ -230,15 +230,33 @@ function rrfFuse(
 }
 
 /**
- * Hybrid retrieval: combine FTS and semantic candidate rankings using RRF.
- *
- * If the embedding provider is unavailable, falls back to FTS-only.
- * If semantic returns no candidates, FTS results are still returned.
+ * Execution diagnostics for a single retrieval call. Evaluation uses these to
+ * report honestly which paths actually ran, so an FTS fallback is never
+ * mislabelled as a hybrid result.
  */
-export async function searchKnowledgeCollections(
+export interface RetrievalDiagnostics {
+  /** The FTS path executed (or was skipped by semanticOnly). */
+  ftsExecuted: boolean;
+  /** The semantic path produced a query embedding and executed a search. */
+  semanticExecuted: boolean;
+  /** Semantic was attempted but failed; results are FTS-only. */
+  semanticFallback: boolean;
+  /** No embedding provider is configured/available at all. */
+  semanticUnavailable: boolean;
+}
+
+/**
+ * Hybrid retrieval with explicit execution diagnostics.
+ *
+ * Behaviour is identical to `searchKnowledgeCollections` (graceful FTS
+ * fallback preserved for production), but the caller additionally learns
+ * which retrieval paths actually executed so evaluation reporting can stay
+ * truthful.
+ */
+export async function searchWithDiagnostics(
   userQuery: string,
   limitOrOptions: number | SearchOptions = 4
-): Promise<ChunkRecord[]> {
+): Promise<{ results: ChunkRecord[]; diagnostics: RetrievalDiagnostics }> {
   const options: SearchOptions =
     typeof limitOrOptions === 'number'
       ? { limit: limitOrOptions }
@@ -251,16 +269,32 @@ export async function searchKnowledgeCollections(
 
   const cleanQuery = userQuery.trim();
   if (!cleanQuery) {
-    return [];
+    return {
+      results: [],
+      diagnostics: {
+        ftsExecuted: false,
+        semanticExecuted: false,
+        semanticFallback: false,
+        semanticUnavailable: !ftsOnly,
+      },
+    };
   }
 
   const candidateLimit = DEFAULT_CANDIDATE_LIMIT;
+
+  const diagnostics: RetrievalDiagnostics = {
+    ftsExecuted: false,
+    semanticExecuted: false,
+    semanticFallback: false,
+    semanticUnavailable: false,
+  };
 
   // Path 1: Full-text retrieval (always runs unless semanticOnly).
   let ftsCandidates: RankedCandidate[] = [];
   if (!semanticOnly) {
     try {
       ftsCandidates = await ftsRetrieval(cleanQuery, candidateLimit, minCoverage);
+      diagnostics.ftsExecuted = true;
     } catch (err) {
       console.error('FTS retrieval failed:', err);
     }
@@ -277,9 +311,14 @@ export async function searchKnowledgeCollections(
       if (provider) {
         const queryVector = await provider.embedQuery(cleanQuery);
         semanticCandidates = await semanticRetrieval(provider, queryVector, candidateLimit);
+        diagnostics.semanticExecuted = true;
+      } else {
+        diagnostics.semanticUnavailable = true;
       }
     } catch (err) {
-      // Embedding failure is non-fatal: FTS results are still returned.
+      // Embedding failure is non-fatal: FTS results are still returned, but
+      // the diagnostics record that the semantic path fell back.
+      diagnostics.semanticFallback = true;
       console.error(
         'Semantic retrieval failed, falling back to FTS:',
         err instanceof Error ? err.message : String(err)
@@ -313,8 +352,25 @@ export async function searchKnowledgeCollections(
   // Take the top `limit` results.
   const top = sorted.slice(0, limit);
 
-  return top.map((entry) => ({
-    ...entry.chunk,
-    score: entry.fusedScore,
-  }));
+  return {
+    results: top.map((entry) => ({
+      ...entry.chunk,
+      score: entry.fusedScore,
+    })),
+    diagnostics,
+  };
+}
+
+/**
+ * Hybrid retrieval: combine FTS and semantic candidate rankings using RRF.
+ *
+ * If the embedding provider is unavailable, falls back to FTS-only.
+ * If semantic returns no candidates, FTS results are still returned.
+ */
+export async function searchKnowledgeCollections(
+  userQuery: string,
+  limitOrOptions: number | SearchOptions = 4
+): Promise<ChunkRecord[]> {
+  const { results } = await searchWithDiagnostics(userQuery, limitOrOptions);
+  return results;
 }

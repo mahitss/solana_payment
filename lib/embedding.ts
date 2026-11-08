@@ -313,13 +313,25 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
 
   private readonly baseUrl: string;
 
+  /** When true, skips per-batch digest revalidation (used by directly-constructed
+   *  test instances that already carry a verified digest). Production instances
+   *  created via `createOllamaEmbeddingProvider` always revalidate. */
+  private readonly skipRevalidation: boolean;
+
   private static readonly MAX_BATCH_SIZE = 64;
   private static readonly HEX_DIGEST_RE = /^[0-9a-f]{64}$/;
 
-  constructor(baseUrl: string, modelId: string, dimensions: number, modelDigest: string) {
+  constructor(
+    baseUrl: string,
+    modelId: string,
+    dimensions: number,
+    modelDigest: string,
+    skipRevalidation = false
+  ) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.modelId = modelId;
     this.dimensions = dimensions;
+    this.skipRevalidation = skipRevalidation;
     let normalized: string;
     if (typeof modelDigest !== 'string' || !modelDigest.trim()) {
       throw new EmbeddingProviderError(
@@ -349,11 +361,49 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   }
 
   /**
+   * Revalidates the configured model identity immediately before an embedding
+   * batch by re-resolving the digest from Ollama `/api/tags`.
+   *
+   * Ollama's `/api/embed` accepts a model name, not an immutable digest, so a
+   * model tag rotation can change the underlying model between the provider's
+   * construction and a later embedding batch. Revalidating here prevents
+   * vectors from being written or read under a stale digest: if the resolved
+   * digest differs from the bound `modelDigest`, we fail closed with
+   * `MODEL_IDENTITY_CHANGED` rather than attributing embeddings to the wrong
+   * model version.
+   *
+   * Network/lookup failures surface as `MODEL_DIGEST_UNAVAILABLE` and are not
+   * cached, consistent with `getEmbeddingProvider`.
+   */
+  async revalidateModelDigest(fetchImpl: typeof fetch = fetch): Promise<void> {
+    const fresh = await resolveOllamaModelDigest(
+      this.baseUrl,
+      this.modelId,
+      fetchImpl
+    );
+    if (fresh !== this.modelDigest) {
+      throw new EmbeddingProviderError(
+        `Model identity changed for "${this.modelId}": recorded digest ` +
+          `${this.modelDigest}, endpoint now reports ${fresh}. ` +
+          'Refusing to embed under a drifted model identity.',
+        'MODEL_IDENTITY_CHANGED'
+      );
+    }
+  }
+
+  /**
    * Calls Ollama `/api/embed` with bounded batching and retries.
    * Batches are processed sequentially to preserve result ordering.
    */
   private async embedBatch(texts: string[]): Promise<number[][]> {
     if (texts.length === 0) return [];
+
+    // Revalidate the model identity before every batch. A model tag rotation
+    // after provider construction must never cause us to write vectors under
+    // a stale digest. Directly-constructed instances (tests) may opt out.
+    if (!this.skipRevalidation) {
+      await this.revalidateModelDigest();
+    }
 
     const results: number[][] = [];
 
@@ -382,6 +432,7 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
         if (
           err instanceof EmbeddingProviderError &&
           (err.code === 'MODEL_NOT_FOUND' ||
+            err.code === 'MODEL_IDENTITY_CHANGED' ||
             err.code === 'INVALID_VECTOR_STRUCTURE' ||
             err.code === 'INVALID_VECTOR_DIMENSIONS' ||
             err.code === 'INVALID_VECTOR_VALUE' ||

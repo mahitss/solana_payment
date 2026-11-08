@@ -163,23 +163,6 @@ async function migrate() {
         END IF;
       END $$;
     `);
-    // Legacy documents created before this column existed approximate their
-    // attempt state from what is actually on disk: a document whose chunks
-    // carry hash-matching embeddings is treated as completed, everything
-    // else becomes pending so the backfill run can triage it honestly.
-    await client.query(`
-      UPDATE documents d
-      SET embedding_status = CASE WHEN EXISTS (
-            SELECT 1 FROM document_chunks c
-            JOIN document_chunk_embeddings e ON e.chunk_id = c.id
-            WHERE c.document_id = d.id AND e.source_hash = c.content_hash
-          ) THEN 'completed' ELSE 'pending' END
-      WHERE d.embedding_status = 'pending'
-        AND EXISTS (
-          SELECT 1 FROM document_chunks c WHERE c.document_id = d.id
-        );
-    `);
-
     // ------------------------------------------------------------------
     // Document chunks
     // ------------------------------------------------------------------
@@ -265,6 +248,26 @@ async function migrate() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_embeddings_chunk
         ON document_chunk_embeddings(chunk_id);
+    `);
+
+    // Legacy documents created before embedding_status existed approximate
+    // their attempt state from what is actually on disk: a document whose
+    // chunks carry hash-matching embeddings is treated as completed,
+    // everything else becomes pending so the backfill run can triage it
+    // honestly. Runs only after document_chunks and
+    // document_chunk_embeddings exist so this migration is safe on a fresh
+    // database as well as existing installations.
+    await client.query(`
+      UPDATE documents d
+      SET embedding_status = CASE WHEN EXISTS (
+            SELECT 1 FROM document_chunks c
+            JOIN document_chunk_embeddings e ON e.chunk_id = c.id
+            WHERE c.document_id = d.id AND e.source_hash = c.content_hash
+          ) THEN 'completed' ELSE 'pending' END
+      WHERE d.embedding_status = 'pending'
+        AND EXISTS (
+          SELECT 1 FROM document_chunks c WHERE c.document_id = d.id
+        );
     `);
 
     // Note: HNSW vector index is intentionally not created here because
