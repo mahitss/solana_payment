@@ -174,6 +174,8 @@ interface EvalResult {
     semanticSkipped: boolean;
     /** Queries where semantic was expected but did not execute (fallback/unavailable). */
     semanticFailures: number;
+    /** Queries where FTS was expected but failed. */
+    ftsFailures: number;
     /** Queries that threw during retrieval. */
     queryFailures: number;
     /** True only when every query executed the intended paths without failure. */
@@ -181,7 +183,8 @@ interface EvalResult {
     modelDigest: string | null;
     ftsOnly: boolean;
     semanticOnly: boolean;
-    pathsUsed: string[]; // ['fts'] | ['semantic'] | ['fts','semantic']
+    /** Retrieval paths that actually produced results, derived from execution. */
+    pathsUsed: string[];
   };
 }
 
@@ -243,17 +246,15 @@ async function evaluateMethod(
   let totalNDCG10 = 0;
   let emptyCount = 0;
   let totalLatency = 0;
-  // Queries where the semantic path was expected but did not actually execute
-  // (provider unavailable, embedding failure, or fallback to FTS). Any such
-  // failure makes the method's semantic/hybrid metrics incomplete.
+  // Actual execution counts across all queries.
+  let ftsFailures = 0;
   let semanticFailures = 0;
   let queryFailures = 0;
+  // Actual paths used (derived from per-query diagnostics, not intended options).
+  const actualPathsUsed = new Set<string>();
 
   const semanticAvailable = ctx.hasEmbeddings;
   const semanticSkipped = !semanticAvailable;
-  const pathsUsed: string[] = [];
-  if (!semanticOnly) pathsUsed.push('fts');
-  if (semanticAvailable) pathsUsed.push('semantic');
 
   for (const q of queries) {
     const relevantIds = new Set(q.relevantChunkIds);
@@ -280,10 +281,10 @@ async function evaluateMethod(
     }
     const latencyMs = Date.now() - start;
 
-    // Truthful semantic accounting: in a semantic-only run, the semantic path
-    // MUST have executed for every query. In a hybrid run, semantic must have
-    // executed (not fallen back) for the hybrid label to be honest.
+    // Aggregate actual execution diagnostics.
     if (diag) {
+      for (const p of diag.pathsUsed) actualPathsUsed.add(p);
+      if (diag.ftsFailed) ftsFailures++;
       if (semanticOnly && !diag.semanticExecuted) {
         semanticFailures++;
       }
@@ -318,18 +319,24 @@ async function evaluateMethod(
   }
 
   const n = queries.length;
+  const pathsUsed = Array.from(actualPathsUsed);
   let label: string;
   if (ftsOnly) {
-    label = 'FTS-only';
+    label = ftsFailures === 0 && queryFailures === 0 ? 'FTS-only' : 'FTS-only — INCOMPLETE';
   } else if (semanticOnly) {
-    label = semanticFailures === 0 ? 'Semantic-only' : 'Semantic-only — INCOMPLETE (semantic execution failed)';
-  } else if (semanticAvailable && semanticFailures === 0) {
+    label = semanticFailures === 0 && queryFailures === 0 ? 'Semantic-only' : 'Semantic-only — INCOMPLETE';
+  } else if (semanticAvailable && ftsFailures === 0 && semanticFailures === 0 && queryFailures === 0) {
     label = 'Hybrid (FTS + semantic)';
   } else if (semanticAvailable) {
-    label = 'Hybrid — INCOMPLETE (semantic fallback on some queries)';
+    label = 'Hybrid — INCOMPLETE';
   } else {
-    label = 'Hybrid — skipped (semantic unavailable)';
+    label = 'NOT EVALUATED';
   }
+
+  const complete =
+    label === 'FTS-only' ||
+    label === 'Semantic-only' ||
+    label === 'Hybrid (FTS + semantic)';
 
   return {
     method,
@@ -346,8 +353,9 @@ async function evaluateMethod(
       semanticAvailable,
       semanticSkipped,
       semanticFailures,
+      ftsFailures,
       queryFailures,
-      complete: semanticFailures === 0 && queryFailures === 0,
+      complete,
       modelDigest: ctx.modelDigest,
       ftsOnly,
       semanticOnly,
@@ -470,6 +478,7 @@ async function main() {
         semanticAvailable: false,
         semanticSkipped: true,
         semanticFailures: validation.labelledQueryCount,
+        ftsFailures: 0,
         queryFailures: 0,
         complete: false,
         modelDigest: null,
@@ -493,6 +502,7 @@ async function main() {
     console.log(`  Semantic available: ${d.semanticAvailable}`);
     console.log(`  Semantic skipped: ${d.semanticSkipped}`);
     console.log(`  Semantic failures: ${d.semanticFailures}`);
+    console.log(`  FTS failures: ${d.ftsFailures}`);
     console.log(`  Query failures: ${d.queryFailures}`);
     console.log(`  Complete: ${d.complete}`);
     if (d.modelDigest) {

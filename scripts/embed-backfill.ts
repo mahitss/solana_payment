@@ -136,7 +136,7 @@ export async function collectChunksForBackfill(provider: EmbeddingProvider): Pro
           WHERE e.provider = $1 AND e.model_id = $2 AND e.model_digest <> $3
         ) AS other_version_rows
       FROM document_chunks c
-      JOIN documents d ON c.document_id = d.id
+      JOIN documents d ON c.document_id = d.id AND c.publisher_id = d.publisher_id
       JOIN publishers p ON c.publisher_id = p.id
       LEFT JOIN document_chunk_embeddings e ON e.chunk_id = c.id
       WHERE ${ELIGIBILITY_SQL_PREDICATE}

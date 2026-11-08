@@ -109,7 +109,7 @@ export async function assertChunksEligible(chunkIds: string[]): Promise<void> {
   const sql = `
     SELECT c.id
     FROM document_chunks c
-    JOIN documents d ON c.document_id = d.id
+    JOIN documents d ON c.document_id = d.id AND c.publisher_id = d.publisher_id
     JOIN publishers p ON c.publisher_id = p.id
     WHERE c.id IN (${placeholders})
       AND ${ELIGIBILITY_SQL_PREDICATE}

@@ -313,11 +313,6 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
 
   private readonly baseUrl: string;
 
-  /** When true, skips per-batch digest revalidation (used by directly-constructed
-   *  test instances that already carry a verified digest). Production instances
-   *  created via `createOllamaEmbeddingProvider` always revalidate. */
-  private readonly skipRevalidation: boolean;
-
   private static readonly MAX_BATCH_SIZE = 64;
   private static readonly HEX_DIGEST_RE = /^[0-9a-f]{64}$/;
 
@@ -325,13 +320,11 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
     baseUrl: string,
     modelId: string,
     dimensions: number,
-    modelDigest: string,
-    skipRevalidation = false
+    modelDigest: string
   ) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.modelId = modelId;
     this.dimensions = dimensions;
-    this.skipRevalidation = skipRevalidation;
     let normalized: string;
     if (typeof modelDigest !== 'string' || !modelDigest.trim()) {
       throw new EmbeddingProviderError(
@@ -394,16 +387,14 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   /**
    * Calls Ollama `/api/embed` with bounded batching and retries.
    * Batches are processed sequentially to preserve result ordering.
+   *
+   * Model identity is revalidated before AND after every individual
+   * inference request inside `embedBatchOnce`, so a tag rotation between
+   * requests (or between retries) is always detected before vectors are
+   * returned.
    */
   private async embedBatch(texts: string[]): Promise<number[][]> {
     if (texts.length === 0) return [];
-
-    // Revalidate the model identity before every batch. A model tag rotation
-    // after provider construction must never cause us to write vectors under
-    // a stale digest. Directly-constructed instances (tests) may opt out.
-    if (!this.skipRevalidation) {
-      await this.revalidateModelDigest();
-    }
 
     const results: number[][] = [];
 
@@ -463,6 +454,10 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
    *   never reclassified as timeouts.
    */
   private async embedBatchOnce(texts: string[]): Promise<number[][]> {
+    // Pre-request identity validation: confirm the model digest has not
+    // drifted before issuing this inference request.
+    await this.revalidateModelDigest();
+
     const controller = new AbortController();
     let timedOut = false;
     const timeoutId = setTimeout(() => {
@@ -547,6 +542,11 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
         )
       );
     }
+
+    // Post-response identity validation: confirm the model digest is still
+    // unchanged after the inference response. This catches tag rotation that
+    // occurred between the pre-request check and the response.
+    await this.revalidateModelDigest();
 
     return vectors;
   }

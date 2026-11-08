@@ -83,7 +83,7 @@ async function ftsRetrieval(
           ) / array_length(qt.terms, 1)
         END AS term_coverage
       FROM document_chunks c
-      JOIN documents d ON c.document_id = d.id
+      JOIN documents d ON c.document_id = d.id AND c.publisher_id = d.publisher_id
       JOIN publishers p ON c.publisher_id = p.id
       CROSS JOIN query_terms qt
       WHERE ${ELIGIBILITY_SQL_PREDICATE}
@@ -149,7 +149,7 @@ async function semanticRetrieval(
       e.embedding <=> $1::vector AS cosine_distance
     FROM document_chunk_embeddings e
     JOIN document_chunks c ON e.chunk_id = c.id
-    JOIN documents d ON c.document_id = d.id
+    JOIN documents d ON c.document_id = d.id AND c.publisher_id = d.publisher_id
     JOIN publishers p ON c.publisher_id = p.id
     WHERE ${ELIGIBILITY_SQL_PREDICATE}
       AND e.provider = $2
@@ -232,17 +232,22 @@ function rrfFuse(
 /**
  * Execution diagnostics for a single retrieval call. Evaluation uses these to
  * report honestly which paths actually ran, so an FTS fallback is never
- * mislabelled as a hybrid result.
+ * mislabelled as a hybrid result. All flags reflect ACTUAL execution, not
+ * intended options.
  */
 export interface RetrievalDiagnostics {
-  /** The FTS path executed (or was skipped by semanticOnly). */
+  /** The FTS path executed (not skipped by semanticOnly). */
   ftsExecuted: boolean;
+  /** The FTS path threw an error. */
+  ftsFailed: boolean;
   /** The semantic path produced a query embedding and executed a search. */
   semanticExecuted: boolean;
   /** Semantic was attempted but failed; results are FTS-only. */
   semanticFallback: boolean;
   /** No embedding provider is configured/available at all. */
   semanticUnavailable: boolean;
+  /** Retrieval paths that actually produced results, derived from execution. */
+  pathsUsed: string[];
 }
 
 /**
@@ -273,9 +278,11 @@ export async function searchWithDiagnostics(
       results: [],
       diagnostics: {
         ftsExecuted: false,
+        ftsFailed: false,
         semanticExecuted: false,
         semanticFallback: false,
         semanticUnavailable: !ftsOnly,
+        pathsUsed: [],
       },
     };
   }
@@ -284,9 +291,11 @@ export async function searchWithDiagnostics(
 
   const diagnostics: RetrievalDiagnostics = {
     ftsExecuted: false,
+    ftsFailed: false,
     semanticExecuted: false,
     semanticFallback: false,
     semanticUnavailable: false,
+    pathsUsed: [],
   };
 
   // Path 1: Full-text retrieval (always runs unless semanticOnly).
@@ -295,7 +304,9 @@ export async function searchWithDiagnostics(
     try {
       ftsCandidates = await ftsRetrieval(cleanQuery, candidateLimit, minCoverage);
       diagnostics.ftsExecuted = true;
+      diagnostics.pathsUsed.push('fts');
     } catch (err) {
+      diagnostics.ftsFailed = true;
       console.error('FTS retrieval failed:', err);
     }
   }
@@ -312,6 +323,7 @@ export async function searchWithDiagnostics(
         const queryVector = await provider.embedQuery(cleanQuery);
         semanticCandidates = await semanticRetrieval(provider, queryVector, candidateLimit);
         diagnostics.semanticExecuted = true;
+        diagnostics.pathsUsed.push('semantic');
       } else {
         diagnostics.semanticUnavailable = true;
       }

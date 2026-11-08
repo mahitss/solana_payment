@@ -93,7 +93,7 @@ async function loadEligibleChunksForQuote(
            d.title AS document_title, d.price_per_query_usdc,
            p.wallet_address AS publisher_wallet, p.name AS publisher_name
     FROM document_chunks c
-    JOIN documents d ON c.document_id = d.id
+    JOIN documents d ON c.document_id = d.id AND c.publisher_id = d.publisher_id
     JOIN publishers p ON c.publisher_id = p.id
     WHERE c.id IN (${placeholders})
       AND ${ELIGIBILITY_SQL_PREDICATE}

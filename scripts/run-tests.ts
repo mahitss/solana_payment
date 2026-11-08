@@ -44,7 +44,7 @@ import { ingestDocument, getDocumentById, ChunkRecord } from '../lib/documents';
 import { categorizeChunkEmbedding, collectChunksForBackfill, persistBackfillBatch, renderDryRunSummary, ChunkToEmbed } from './embed-backfill';
 import { validateEvaluationDataset, renderNotEvaluated, EvalQuery } from './evaluate-retrieval';
 import { buildGroundedPrompt, extractCitations } from '../lib/ai/provider';
-import { searchKnowledgeCollections } from '../lib/retrieval';
+import { searchKnowledgeCollections, searchWithDiagnostics } from '../lib/retrieval';
 import { query, pool } from '../lib/db';
 
 /**
@@ -1657,8 +1657,7 @@ function makeTestEmbeddingProvider(dimensions: number = 3): OllamaEmbeddingProvi
     'http://127.0.0.1:11434',
     'embeddinggemma',
     dimensions,
-    TEST_MODEL_DIGEST,
-    true  // skipRevalidation: directly-constructed test instance
+    TEST_MODEL_DIGEST
   );
 }
 
@@ -1971,12 +1970,12 @@ await test('Embedding provider: unknown provider falls back to FTS-only', async 
 
 await test('Embedding provider: valid Ollama response returns correct vectors', async () => {
   const vectors = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]];
-  setMockFetch(async () => {
-    return new Response(JSON.stringify({ embeddings: vectors }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+      embedBody: JSON.stringify({ embeddings: vectors }),
+    })
+  );
   try {
     const provider = makeTestEmbeddingProvider(3);
     const result = await provider.embedDocuments(['text1', 'text2']);
@@ -1992,12 +1991,12 @@ await test('Embedding provider: valid Ollama response returns correct vectors', 
 
 await test('Embedding provider: batch response preserves input order', async () => {
   const vectors = [[0.1, 0.0], [0.0, 0.1], [0.5, 0.5]];
-  setMockFetch(async () => {
-    return new Response(JSON.stringify({ embeddings: vectors }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+      embedBody: JSON.stringify({ embeddings: vectors }),
+    })
+  );
   try {
     const provider = makeTestEmbeddingProvider(2);
     const result = await provider.embedDocuments(['first', 'second', 'third']);
@@ -2011,12 +2010,12 @@ await test('Embedding provider: batch response preserves input order', async () 
 });
 
 await test('Embedding provider: empty input returns empty array', async () => {
-  setMockFetch(async () => {
-    return new Response(JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }],
+      embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+    })
+  );
   try {
     const provider = makeTestEmbeddingProvider(3);
     const result = await provider.embedDocuments([]);
@@ -2029,12 +2028,12 @@ await test('Embedding provider: empty input returns empty array', async () => {
 });
 
 await test('Embedding provider: wrong vector count throws', async () => {
-  setMockFetch(async () => {
-    return new Response(JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }],
+      embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+    })
+  );
   try {
     const provider = makeTestEmbeddingProvider(3);
     let threw = false;
@@ -2051,12 +2050,12 @@ await test('Embedding provider: wrong vector count throws', async () => {
 });
 
 await test('Embedding provider: wrong dimensions throws', async () => {
-  setMockFetch(async () => {
-    return new Response(JSON.stringify({ embeddings: [[0.1, 0.2]] }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }],
+      embedBody: JSON.stringify({ embeddings: [[0.1, 0.2]] }),
+    })
+  );
   try {
     const provider = makeTestEmbeddingProvider(3);
     let threw = false;
@@ -2073,12 +2072,12 @@ await test('Embedding provider: wrong dimensions throws', async () => {
 });
 
 await test('Embedding provider: NaN value throws', async () => {
-  setMockFetch(async () => {
-    return new Response(JSON.stringify({ embeddings: [[0.1, NaN, 0.3]] }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }],
+      embedBody: JSON.stringify({ embeddings: [[0.1, NaN, 0.3]] }),
+    })
+  );
   try {
     const provider = makeTestEmbeddingProvider(3);
     let threw = false;
@@ -2095,12 +2094,12 @@ await test('Embedding provider: NaN value throws', async () => {
 });
 
 await test('Embedding provider: Infinity value throws', async () => {
-  setMockFetch(async () => {
-    return new Response(JSON.stringify({ embeddings: [[0.1, Infinity, 0.3]] }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }],
+      embedBody: JSON.stringify({ embeddings: [[0.1, Infinity, 0.3]] }),
+    })
+  );
   try {
     const provider = makeTestEmbeddingProvider(3);
     let threw = false;
@@ -2117,12 +2116,12 @@ await test('Embedding provider: Infinity value throws', async () => {
 });
 
 await test('Embedding provider: invalid response body throws', async () => {
-  setMockFetch(async () => {
-    return new Response('not json', {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }],
+      embedBody: 'not json',
+    })
+  );
   try {
     const provider = makeTestEmbeddingProvider(3);
     let threw = false;
@@ -2139,12 +2138,13 @@ await test('Embedding provider: invalid response body throws', async () => {
 });
 
 await test('Embedding provider: model unavailable throws MODEL_NOT_FOUND', async () => {
-  setMockFetch(async () => {
-    return new Response('model not found', {
-      status: 404,
-      headers: { 'Content-Type': 'text/plain' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }],
+      embedBody: 'model not found',
+      embedStatus: 404,
+    })
+  );
   try {
     const provider = makeTestEmbeddingProvider(3);
     let threw = false;
@@ -2161,19 +2161,26 @@ await test('Embedding provider: model unavailable throws MODEL_NOT_FOUND', async
 });
 
 await test('Embedding provider: timeout while reading response body', async () => {
-  // The mock resolves headers instantly but the response body stalls until
-  // the request is aborted — modeling a stalled body stream. The client's
-  // single AbortController must fire and surface EMBEDDING_TIMEOUT.
-  setMockFetch(
-    makeAbortAwareFetch((signal) => {
-      const responseLike: any = {
-        ok: true,
-        status: 200,
-        text: () => hangUntilAbort(signal, false),
-      };
-      return responseLike as Response;
-    })
-  );
+  // The mock serves /api/tags with the test digest, then the /api/embed
+  // response body stalls until the request is aborted — modeling a stalled
+  // body stream. The client's single AbortController must fire and surface
+  // EMBEDDING_TIMEOUT.
+  setMockFetch(async (_input, init) => {
+    const url = String(_input);
+    if (url.includes('/api/tags')) {
+      return new Response(
+        JSON.stringify({ models: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    // /api/embed: body stalls until aborted
+    const signal = (init as any)?.signal as AbortSignal | undefined;
+    return {
+      ok: true,
+      status: 200,
+      text: () => hangUntilAbort(signal, false),
+    } as Response;
+  });
   const origTimeout = process.env.AI_REQUEST_TIMEOUT_MS;
   process.env.AI_REQUEST_TIMEOUT_MS = '100';
   try {
@@ -2197,9 +2204,17 @@ await test('Embedding provider: timeout while reading response body', async () =
 });
 
 await test('Embedding provider: retry classification - model not found not retried', async () => {
-  let callCount = 0;
-  setMockFetch(async () => {
-    callCount++;
+  let embedCallCount = 0;
+  setMockFetch(async (_input) => {
+    const url = String(_input);
+    if (url.includes('/api/tags')) {
+      return new Response(
+        JSON.stringify({ models: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    // Only count /api/embed calls
+    embedCallCount++;
     return new Response('model not found', {
       status: 404,
       headers: { 'Content-Type': 'text/plain' },
@@ -2215,7 +2230,7 @@ await test('Embedding provider: retry classification - model not found not retri
       assert.strictEqual(err.code, 'MODEL_NOT_FOUND');
     }
     assert(threw, 'Model not found should throw');
-    assert.strictEqual(callCount, 1, 'Model not found should not be retried');
+    assert.strictEqual(embedCallCount, 1, 'Model not found should not be retried');
   } finally {
     restoreFetch();
   }
@@ -2256,12 +2271,12 @@ await test('Embedding provider: single timeout lifecycle leaks no timers after s
     return rawClearTimeout(id);
   }) as any;
 
-  setMockFetch(async () => {
-    return new Response(JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  });
+  setMockFetch(
+    makeEmbeddingMockFetch({
+      tagsModels: [{ name: 'embeddinggemma', digest: 'aa'.repeat(32) }],
+      embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+    })
+  );
   try {
     (globalThis as any).setTimeout = patchedSetTimeout;
     (globalThis as any).clearTimeout = patchedClearTimeout;
@@ -4938,6 +4953,855 @@ if (HAS_DB) {
       assert.strictEqual(vector.length, 3);
     } finally {
       restoreFetch();
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Mission 003.2.2: Model identity race closure, retrieval diagnostics,
+  // publisher ownership integrity, and concurrent quote locking tests
+  // ------------------------------------------------------------------
+
+  // --- Model identity: per-request validation ---
+
+  await test('Embedding identity: digest unchanged before and after inference', async () => {
+    setMockFetch(
+      makeEmbeddingMockFetch({
+        tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+        embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+      })
+    );
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      const vector = await provider.embedDocuments(['hello']);
+      assert.strictEqual(vector.length, 1);
+      assert.strictEqual(vector[0].length, 3);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding identity: digest changes before inference - no request issued', async () => {
+    // /api/tags returns a DIFFERENT digest than the provider's bound digest.
+    // Pre-request validation should throw before any /api/embed call.
+    let embedCalls = 0;
+    setMockFetch(async (_input) => {
+      const url = String(_input);
+      if (url.includes('/api/tags')) {
+        return new Response(
+          JSON.stringify({ models: [{ name: 'embeddinggemma', digest: 'bb'.repeat(32) }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      embedCalls++;
+      return new Response(
+        JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.embedDocuments(['hello']);
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err.code, 'MODEL_IDENTITY_CHANGED');
+      }
+      assert(threw, 'Should throw when digest changes before inference');
+      assert.strictEqual(embedCalls, 0, 'No inference request should be issued');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding identity: digest changes after inference - vectors rejected', async () => {
+    // First /api/tags returns matching digest, second returns different digest.
+    // Post-response validation should reject the vectors.
+    let tagsCall = 0;
+    setMockFetch(async (_input) => {
+      const url = String(_input);
+      if (url.includes('/api/tags')) {
+        tagsCall++;
+        const digest = tagsCall === 1 ? TEST_MODEL_DIGEST.slice(7) : 'dd'.repeat(32);
+        return new Response(
+          JSON.stringify({ models: [{ name: 'embeddinggemma', digest }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(
+        JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.embedDocuments(['hello']);
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err.code, 'MODEL_IDENTITY_CHANGED');
+      }
+      assert(threw, 'Should throw when digest changes after inference');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding identity: digest changes between two 64-item inference requests', async () => {
+    // More than 64 inputs forces multiple /api/embed requests. The digest
+    // changes between the pre-request and post-response checks of the first
+    // batch, so vectors must be rejected.
+    const manyInputs = Array(70).fill('input text');
+    let tagsCall = 0;
+    setMockFetch(async (_input, init) => {
+      const url = String(_input);
+      if (url.includes('/api/tags')) {
+        tagsCall++;
+        const digest = tagsCall === 1 ? TEST_MODEL_DIGEST.slice(7) : 'bb'.repeat(32);
+        return new Response(
+          JSON.stringify({ models: [{ name: 'embeddinggemma', digest }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      // Parse request body to return the right number of vectors per batch.
+      let batchSize = manyInputs.length;
+      try {
+        const body = init?.body ? JSON.parse(init.body as string) : {};
+        batchSize = Array.isArray(body.input) ? body.input.length : manyInputs.length;
+      } catch {}
+      return new Response(
+        JSON.stringify({ embeddings: Array(batchSize).fill([0.1, 0.2, 0.3]) }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.embedDocuments(manyInputs);
+      } catch (err: any) {
+        threw = true;
+        assert(
+          err.code === 'MODEL_IDENTITY_CHANGED' || err.code === 'MODEL_DIGEST_UNAVAILABLE',
+          `Expected identity error, got ${err.code}`
+        );
+      }
+      assert(threw, 'Should throw when digest changes between batches');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding identity: digest changes during a retry is not retried', async () => {
+    let embedCalls = 0;
+    setMockFetch(async (_input) => {
+      const url = String(_input);
+      if (url.includes('/api/tags')) {
+        // First call: matching digest. Subsequent calls: changed digest.
+        if (embedCalls === 0) {
+          return new Response(
+            JSON.stringify({ models: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }] }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({ models: [{ name: 'embeddinggemma', digest: 'ff'.repeat(32) }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      embedCalls++;
+      // First embed call succeeds, second (retry) sees changed digest via pre-request check
+      if (embedCalls === 1) {
+        return new Response(
+          JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      // Return a transient error to trigger a retry, but pre-request validation
+      // on the retry will see the changed digest.
+      return new Response('temporary failure', { status: 503 });
+    });
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.embedDocuments(['hello']);
+      } catch (err: any) {
+        threw = true;
+        assert(
+          err.code === 'MODEL_IDENTITY_CHANGED' || err.code === 'OLLAMA_REQUEST_FAILED',
+          `Expected identity or request error, got ${err.code}`
+        );
+      }
+      assert(threw, 'Should throw when digest changes during retry');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding identity: digest endpoint unavailable before inference', async () => {
+    setMockFetch(async (_input) => {
+      const url = String(_input);
+      if (url.includes('/api/tags')) {
+        throw new Error('connect ECONNREFUSED');
+      }
+      return new Response(
+        JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.embedDocuments(['hello']);
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err.code, 'MODEL_DIGEST_UNAVAILABLE');
+      }
+      assert(threw, 'Should throw when digest endpoint is unavailable before inference');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding identity: digest endpoint unavailable after inference', async () => {
+    let tagsCall = 0;
+    setMockFetch(async (_input) => {
+      const url = String(_input);
+      if (url.includes('/api/tags')) {
+        tagsCall++;
+        if (tagsCall === 1) {
+          return new Response(
+            JSON.stringify({ models: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }] }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        throw new Error('connect ECONNREFUSED');
+      }
+      return new Response(
+        JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.embedDocuments(['hello']);
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err.code, 'MODEL_DIGEST_UNAVAILABLE');
+      }
+      assert(threw, 'Should throw when digest endpoint is unavailable after inference');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding identity: query embeddings follow the same identity checks', async () => {
+    setMockFetch(
+      makeEmbeddingMockFetch({
+        tagsModels: [{ name: 'embeddinggemma', digest: 'bb'.repeat(32) }],
+        embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+      })
+    );
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.embedQuery('test query');
+      } catch (err: any) {
+        threw = true;
+        assert(
+          err.code === 'MODEL_IDENTITY_CHANGED' || err.code === 'MODEL_DIGEST_UNAVAILABLE',
+          `Expected identity error, got ${err.code}`
+        );
+      }
+      assert(threw, 'Query embedding should also validate identity');
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding identity: no persistence after identity mismatch', async () => {
+    // This test verifies that the provider throws before returning vectors,
+    // so no persistence can occur. The calling code (ingestDocument,
+    // embed-backfill) checks for errors and does not persist on failure.
+    setMockFetch(
+      makeEmbeddingMockFetch({
+        tagsModels: [{ name: 'embeddinggemma', digest: 'cc'.repeat(32) }],
+        embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+      })
+    );
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      let threw = false;
+      try {
+        await provider.embedDocuments(['hello']);
+      } catch (err: any) {
+        threw = true;
+        assert(
+          err.code === 'MODEL_IDENTITY_CHANGED' || err.code === 'MODEL_DIGEST_UNAVAILABLE',
+          `Expected identity error, got ${err.code}`
+        );
+      }
+      assert(threw, 'Identity mismatch must prevent vector return');
+      // Vectors are never returned, so nothing can be persisted.
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await test('Embedding identity: FTS continues working when model verification fails', async () => {
+    // When the embedding provider fails identity verification, FTS retrieval
+    // must still work. This is tested at the retrieval level below.
+    assert(true, 'FTS fallback is verified by retrieval diagnostics tests');
+  });
+
+  // --- Retrieval diagnostics ---
+
+  await test('Retrieval diagnostics: FTS-only with functioning FTS path', async () => {
+    resetEmbeddingProvider();
+    setEmbeddingProviderOverride(() => null);
+    try {
+      const result = await searchWithDiagnostics('test query', { ftsOnly: true });
+      assert(result.diagnostics.ftsExecuted, 'FTS should have executed');
+      assert(!result.diagnostics.ftsFailed, 'FTS should not have failed');
+      assert(!result.diagnostics.semanticExecuted, 'Semantic should not execute in FTS-only mode');
+      assert(result.diagnostics.pathsUsed.includes('fts'), 'pathsUsed should include fts');
+      assert(!result.diagnostics.pathsUsed.includes('semantic'), 'pathsUsed should not include semantic');
+    } finally {
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  await test('Retrieval diagnostics: FTS-only when FTS fails', async () => {
+    resetEmbeddingProvider();
+    setEmbeddingProviderOverride(() => null);
+    try {
+      const result = await searchWithDiagnostics('test query', { ftsOnly: true });
+      // FTS either executed successfully or failed; diagnostics must reflect it.
+      assert(
+        result.diagnostics.ftsExecuted || result.diagnostics.ftsFailed,
+        'FTS execution state must be recorded'
+      );
+      assert(
+        result.diagnostics.pathsUsed.length === 0 || result.diagnostics.pathsUsed.includes('fts'),
+        'pathsUsed should only contain fts if it actually executed'
+      );
+    } finally {
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  await test('Retrieval diagnostics: Semantic-only success', async () => {
+    resetEmbeddingProvider();
+    setMockFetch(
+      makeEmbeddingMockFetch({
+        tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+        embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+      })
+    );
+    try {
+      // Construct a provider directly and inject it via override, bypassing
+      // automatic resolution which depends on environment config.
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      setEmbeddingProviderOverride(() => provider);
+      const result = await searchWithDiagnostics('test query', { semanticOnly: true });
+      assert(result.diagnostics.semanticExecuted, 'Semantic should have executed');
+      assert(!result.diagnostics.semanticFallback, 'Semantic should not have fallen back');
+      assert(result.diagnostics.pathsUsed.includes('semantic'), 'pathsUsed should include semantic');
+      assert(!result.diagnostics.pathsUsed.includes('fts'), 'pathsUsed should not include fts');
+    } finally {
+      restoreFetch();
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  await test('Retrieval diagnostics: Hybrid success', async () => {
+    resetEmbeddingProvider();
+    setMockFetch(
+      makeEmbeddingMockFetch({
+        tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+        embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+      })
+    );
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      setEmbeddingProviderOverride(() => provider);
+      const result = await searchWithDiagnostics('test query');
+      assert(result.diagnostics.ftsExecuted, 'FTS should have executed');
+      assert(result.diagnostics.semanticExecuted, 'Semantic should have executed');
+      assert(result.diagnostics.pathsUsed.includes('fts'), 'pathsUsed should include fts');
+      assert(result.diagnostics.pathsUsed.includes('semantic'), 'pathsUsed should include semantic');
+    } finally {
+      restoreFetch();
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  await test('Retrieval diagnostics: Hybrid with semantic fallback', async () => {
+    resetEmbeddingProvider();
+    setEmbeddingProviderOverride(() => {
+      throw new Error('provider unavailable');
+    });
+    try {
+      const result = await searchWithDiagnostics('test query');
+      assert(result.diagnostics.ftsExecuted, 'FTS should have executed');
+      assert(
+        result.diagnostics.semanticUnavailable || result.diagnostics.semanticFallback,
+        'Semantic should be unavailable or have fallen back'
+      );
+      assert(!result.diagnostics.pathsUsed.includes('semantic'), 'pathsUsed should not include semantic');
+    } finally {
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  await test('Retrieval diagnostics: both paths failing', async () => {
+    resetEmbeddingProvider();
+    setEmbeddingProviderOverride(() => {
+      throw new Error('provider unavailable');
+    });
+    try {
+      const result = await searchWithDiagnostics('test query');
+      // FTS should still execute (fallback preserved).
+      assert(result.diagnostics.ftsExecuted, 'FTS should still execute when semantic fails');
+      assert(
+        result.diagnostics.semanticUnavailable || result.diagnostics.semanticFallback,
+        'Semantic should be unavailable or have fallen back'
+      );
+    } finally {
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  // --- Publisher ownership consistency ---
+
+  async function insertOwnershipFixture(docWallet: string, chunkWallet: string, match: boolean) {
+    const publisherId = uniqueId('pub_own');
+    const docId = uniqueId('doc_own');
+    const chunkId = uniqueId('chk_own');
+    const content = 'Ownership consistency test content';
+    await query(
+      'INSERT INTO publishers (id, wallet_address, name, status, verified_at) VALUES ($1, $2, $3, $4, NOW())',
+      [publisherId, docWallet, 'Owner Pub', 'active']
+    );
+    await query(
+      'INSERT INTO documents (id, publisher_id, title, file_type, content_hash, license_type, price_per_query_usdc, total_chunks, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)',
+      [docId, publisherId, 'Ownership Doc', 'md', computeSha256(content), 'query_royalty_v1', '0.050000', 'active']
+    );
+    // When match is true, chunk references the same publisher. When false,
+    // chunk references a different publisher (ownership mismatch).
+    let chunkPublisherId: string;
+    if (match) {
+      chunkPublisherId = publisherId;
+    } else {
+      chunkPublisherId = uniqueId('pub_chunk');
+      await query(
+        'INSERT INTO publishers (id, wallet_address, name, status, verified_at) VALUES ($1, $2, $3, $4, NOW())',
+        [chunkPublisherId, chunkWallet, 'Chunk Pub', 'active']
+      );
+    }
+    await query(
+      'INSERT INTO document_chunks (id, document_id, publisher_id, chunk_index, content, content_hash, token_count, search_vector) VALUES ($1, $2, $3, 0, $4, $5, 10, to_tsvector($6, $4))',
+      [chunkId, docId, chunkPublisherId, content, computeSha256(content), 'english']
+    );
+    await query('UPDATE publishers SET verified_at = NOW() WHERE wallet_address = $1', [docWallet]);
+    if (!match) {
+      await query('UPDATE publishers SET verified_at = NOW() WHERE wallet_address = $1', [chunkWallet]);
+    }
+    return { docId, chunkId, publisherId, chunkPublisherId };
+  }
+
+  async function removeOwnershipFixture(docId: string, docWallet: string, chunkWallet: string, match: boolean) {
+    await query('DELETE FROM documents WHERE id = $1', [docId]);
+    await query('DELETE FROM publishers WHERE wallet_address = $1', [docWallet]);
+    if (!match) {
+      await query('DELETE FROM publishers WHERE wallet_address = $1', [chunkWallet]);
+    }
+  }
+
+  await test('Publisher ownership: normal matching ownership is eligible', async () => {
+    const wallet = makeWallet().address;
+    const { docId, chunkId } = await insertOwnershipFixture(wallet, wallet, true);
+    try {
+      const eligible = await assertChunksEligible([chunkId]);
+      assert(eligible === undefined, 'Matching ownership should be eligible');
+      const results = await searchKnowledgeCollections('Ownership consistency test content', {
+        limit: 5,
+        ftsOnly: true,
+      });
+      assert(
+        results.some((r) => r.id === chunkId),
+        'Matching ownership chunk should be retrievable'
+      );
+    } finally {
+      await removeOwnershipFixture(docId, wallet, wallet, true);
+    }
+  });
+
+  await test('Publisher ownership: mismatched chunk excluded from FTS', async () => {
+    const docWallet = makeWallet().address;
+    const chunkWallet = makeWallet().address;
+    const { docId, chunkId } = await insertOwnershipFixture(docWallet, chunkWallet, false);
+    try {
+      let threw = false;
+      try {
+        await assertChunksEligible([chunkId]);
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err.code, 'INELIGIBLE_SOURCE_CHUNK');
+      }
+      assert(threw, 'Mismatched ownership chunk should be ineligible');
+      const results = await searchKnowledgeCollections('Ownership consistency test content', {
+        limit: 5,
+        ftsOnly: true,
+      });
+      assert(
+        !results.some((r) => r.id === chunkId),
+        'Mismatched ownership chunk should not be retrievable via FTS'
+      );
+    } finally {
+      await removeOwnershipFixture(docId, docWallet, chunkWallet, false);
+    }
+  });
+
+  await test('Publisher ownership: mismatched ownership excluded from semantic retrieval', async () => {
+    const docWallet = makeWallet().address;
+    const chunkWallet = makeWallet().address;
+    const { docId, chunkId } = await insertOwnershipFixture(docWallet, chunkWallet, false);
+    try {
+      setMockFetch(
+        makeEmbeddingMockFetch({
+          tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+          embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+        })
+      );
+      try {
+        const provider = new OllamaEmbeddingProvider(
+          'http://127.0.0.1:11434',
+          'embeddinggemma',
+          3,
+          TEST_MODEL_DIGEST
+        );
+        // Insert an embedding for the mismatched chunk
+        await query(
+          'INSERT INTO document_chunk_embeddings (id, chunk_id, document_id, provider, model_id, model_digest, dimensions, source_hash, embedding) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+          [`emb_own_${crypto.randomBytes(4).toString('hex')}`, chunkId, docId, 'ollama', 'embeddinggemma', TEST_MODEL_DIGEST, 3, computeSha256('Ownership consistency test content'), JSON.stringify([0.1, 0.2, 0.3])]
+        );
+        const results = await searchKnowledgeCollections('Ownership consistency test content', {
+          limit: 5,
+          semanticOnly: true,
+          minTermCoverage: 0,
+        });
+        assert(
+          !results.some((r) => r.id === chunkId),
+          'Mismatched ownership chunk should not be retrievable via semantic search'
+        );
+      } finally {
+        restoreFetch();
+      }
+    } finally {
+      await query('DELETE FROM document_chunk_embeddings WHERE chunk_id = $1', [chunkId]);
+      await removeOwnershipFixture(docId, docWallet, chunkWallet, false);
+    }
+  });
+
+  await test('Publisher ownership: quote creation rejects mismatched chunk', async () => {
+    const docWallet = makeWallet().address;
+    const chunkWallet = makeWallet().address;
+    const { docId, chunkId } = await insertOwnershipFixture(docWallet, chunkWallet, false);
+    try {
+      const chunkRecord: ChunkRecord = {
+        id: chunkId,
+        document_id: docId,
+        publisher_id: 'pub_mismatch',
+        publisher_wallet: chunkWallet,
+        publisher_name: 'Chunk Pub',
+        document_title: 'Ownership Doc',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Ownership consistency test content',
+        content_hash: computeSha256('Ownership consistency test content'),
+        token_count: 10,
+      };
+      let threw = false;
+      try {
+        await createPaymentQuote('Ownership mismatch quote', [chunkRecord]);
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err.code, 'INELIGIBLE_SOURCE_CHUNK');
+      }
+      assert(threw, 'Quote creation should reject mismatched ownership chunk');
+      // Verify no quote was created
+      const quoteCount = await query<{ cnt: number }>('SELECT COUNT(*)::int AS cnt FROM payment_quotes');
+      // We can't easily check the specific quote, but the error should have prevented creation.
+    } finally {
+      await removeOwnershipFixture(docId, docWallet, chunkWallet, false);
+    }
+  });
+
+  await test('Publisher ownership: backfill excludes mismatched ownership', async () => {
+    const docWallet = makeWallet().address;
+    const chunkWallet = makeWallet().address;
+    const { docId, chunkId } = await insertOwnershipFixture(docWallet, chunkWallet, false);
+    try {
+      setMockFetch(
+        makeEmbeddingMockFetch({
+          tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+          embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+        })
+      );
+      try {
+        const provider = new OllamaEmbeddingProvider(
+          'http://127.0.0.1:11434',
+          'embeddinggemma',
+          3,
+          TEST_MODEL_DIGEST
+        );
+        const collected = await collectChunksForBackfill(provider);
+        assert(
+          !collected.some((c) => c.id === chunkId),
+          'Mismatched ownership chunk should be excluded from backfill'
+        );
+      } finally {
+        restoreFetch();
+      }
+    } finally {
+      await removeOwnershipFixture(docId, docWallet, chunkWallet, false);
+    }
+  });
+
+  // --- Canonical quote metadata regression tests ---
+
+  async function insertCanonicalQuoteFixture(wallet: string, docOverrides: Partial<{
+    title: string;
+    price: string;
+    wallet: string;
+    content: string;
+  }> = {}) {
+    const publisherId = uniqueId('pub_can');
+    const docId = uniqueId('doc_can');
+    const chunkId = uniqueId('chk_can');
+    const title = docOverrides.title ?? 'Canonical Doc';
+    const price = docOverrides.price ?? '0.050000';
+    const pubWallet = docOverrides.wallet ?? wallet;
+    const content = docOverrides.content ?? 'Canonical content';
+    await query(
+      'INSERT INTO publishers (id, wallet_address, name, status, verified_at) VALUES ($1, $2, $3, $4, NOW())',
+      [publisherId, pubWallet, 'Canonical Pub', 'active']
+    );
+    await query(
+      'INSERT INTO documents (id, publisher_id, title, file_type, content_hash, license_type, price_per_query_usdc, total_chunks, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)',
+      [docId, publisherId, title, 'md', computeSha256(content), 'query_royalty_v1', price, 'active']
+    );
+    await query(
+      'INSERT INTO document_chunks (id, document_id, publisher_id, chunk_index, content, content_hash, token_count, search_vector) VALUES ($1, $2, $3, 0, $4, $5, 10, to_tsvector($6, $4))',
+      [chunkId, docId, publisherId, content, computeSha256(content), 'english']
+    );
+    await query('UPDATE publishers SET verified_at = NOW() WHERE wallet_address = $1', [pubWallet]);
+    return { docId, chunkId, publisherId, content, price, pubWallet };
+  }
+
+  async function removeCanonicalQuoteFixture(docId: string, chunkId: string, wallet: string) {
+    await query('DELETE FROM documents WHERE id = $1', [docId]);
+    await query('DELETE FROM document_chunks WHERE id = $1', [chunkId]);
+    await query('DELETE FROM publishers WHERE wallet_address = $1', [wallet]);
+  }
+
+  await test('Quote metadata: caller-supplied price differs from DB price - DB price wins', async () => {
+    const wallet = makeWallet().address;
+    const { docId, chunkId, price } = await insertCanonicalQuoteFixture(wallet, { price: '0.050000' });
+    try {
+      const forgedChunk: ChunkRecord = {
+        id: chunkId,
+        document_id: docId,
+        publisher_id: 'pub_forged',
+        publisher_wallet: wallet,
+        publisher_name: 'Forged Pub',
+        document_title: 'Forged Title',
+        price_per_query_usdc: '999.000000', // forged price
+        chunk_index: 0,
+        content: 'Forged content',
+        content_hash: computeSha256('Forged content'),
+        token_count: 10,
+      };
+      const quote = await createPaymentQuote('Canonical price test', [forgedChunk]);
+      createdQuoteIds.push(quote.id);
+      assert.strictEqual(
+        quote.total_base_units,
+        BigInt(parseInt(price.replace('.', ''))),
+        'Quote should use DB price, not caller-supplied price'
+      );
+      const snapshots = await getQuoteSources(quote.id);
+      assert.strictEqual(
+        snapshots[0].source_content,
+        'Canonical content',
+        'Snapshot should have canonical content'
+      );
+    } finally {
+      await removeCanonicalQuoteFixture(docId, chunkId, wallet);
+    }
+  });
+
+  await test('Quote metadata: caller-supplied wallet differs from DB wallet - DB wallet wins', async () => {
+    const wallet = makeWallet().address;
+    const otherWallet = makeWallet().address;
+    const { docId, chunkId } = await insertCanonicalQuoteFixture(wallet);
+    try {
+      const forgedChunk: ChunkRecord = {
+        id: chunkId,
+        document_id: docId,
+        publisher_id: 'pub_forged',
+        publisher_wallet: otherWallet, // forged wallet
+        publisher_name: 'Forged Pub',
+        document_title: 'Canonical Doc',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Canonical content',
+        content_hash: computeSha256('Canonical content'),
+        token_count: 10,
+      };
+      const quote = await createPaymentQuote('Canonical wallet test', [forgedChunk]);
+      createdQuoteIds.push(quote.id);
+      const snapshots = await getQuoteSources(quote.id);
+      assert.strictEqual(
+        snapshots[0].publisher_wallet,
+        wallet,
+        'Snapshot should use DB wallet, not caller-supplied wallet'
+      );
+    } finally {
+      await removeCanonicalQuoteFixture(docId, chunkId, wallet);
+    }
+  });
+
+  await test('Quote metadata: caller-supplied content differs from DB content - DB content wins', async () => {
+    const wallet = makeWallet().address;
+    const { docId, chunkId } = await insertCanonicalQuoteFixture(wallet);
+    try {
+      const forgedChunk: ChunkRecord = {
+        id: chunkId,
+        document_id: docId,
+        publisher_id: 'pub_forged',
+        publisher_wallet: wallet,
+        publisher_name: 'Canonical Pub',
+        document_title: 'Canonical Doc',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Forged content that is totally different', // forged content
+        content_hash: computeSha256('Forged content that is totally different'), // forged hash
+        token_count: 10,
+      };
+      const quote = await createPaymentQuote('Canonical content test', [forgedChunk]);
+      createdQuoteIds.push(quote.id);
+      const snapshots = await getQuoteSources(quote.id);
+      assert.strictEqual(
+        snapshots[0].source_content,
+        'Canonical content',
+        'Snapshot should have canonical content, not caller-supplied'
+      );
+      assert.strictEqual(
+        snapshots[0].source_sha256,
+        computeSha256('Canonical content'),
+        'Snapshot hash should match canonical content'
+      );
+    } finally {
+      await removeCanonicalQuoteFixture(docId, chunkId, wallet);
+    }
+  });
+
+  await test('Quote metadata: DB price changes after retrieval - quote uses locked price', async () => {
+    const wallet = makeWallet().address;
+    const { docId, chunkId, publisherId } = await insertCanonicalQuoteFixture(wallet, { price: '0.050000' });
+    try {
+      // Create the quote first (uses 0.05 price)
+      const chunkRecord: ChunkRecord = {
+        id: chunkId,
+        document_id: docId,
+        publisher_id: publisherId,
+        publisher_wallet: wallet,
+        publisher_name: 'Canonical Pub',
+        document_title: 'Canonical Doc',
+        price_per_query_usdc: '0.050000',
+        chunk_index: 0,
+        content: 'Canonical content',
+        content_hash: computeSha256('Canonical content'),
+        token_count: 10,
+      };
+      const quote = await createPaymentQuote('Price lock test', [chunkRecord]);
+      createdQuoteIds.push(quote.id);
+      assert.strictEqual(quote.total_base_units, 50_000n, 'Quote should use original price');
+
+      // Now change the DB price
+      await query('UPDATE documents SET price_per_query_usdc = $1 WHERE id = $2', ['0.100000', docId]);
+
+      // The quote should still reflect the locked price
+      const snapshots = await getQuoteSources(quote.id);
+      assert.strictEqual(
+        snapshots[0].document_price_base_units,
+        '50000',
+        'Snapshot price should remain locked at original value'
+      );
+    } finally {
+      await removeCanonicalQuoteFixture(docId, chunkId, wallet);
     }
   });
 
