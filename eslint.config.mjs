@@ -35,6 +35,9 @@ const eslintConfig = defineConfig([
     'graphify-out/**',
     'node_modules/**',
     'types/**',
+    // Untracked local smoke-test helper (CommonJS by design, kept out of the
+    // repository on purpose).
+    '.smoke-auth.cjs',
   ]),
 ]);
 

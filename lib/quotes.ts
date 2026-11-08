@@ -3,6 +3,7 @@ import { query, withTransaction } from './db';
 import { ChunkRecord } from './documents';
 import { computeSha256 } from './chunker';
 import { config } from './config';
+import { assertChunksEligible } from './eligibility';
 import {
   SETTLEMENT_ASSET,
   buildMemoPayload,
@@ -62,6 +63,13 @@ export async function createPaymentQuote(
   if (matchedChunks.length === 0) {
     throw new Error('Cannot create quote with zero matched chunks.');
   }
+
+  // Quote-time eligibility revalidation. Retrieval is a point-in-time
+  // snapshot: a chunk that was retrievable a moment ago may have been revoked
+  // since (document or publisher revoked, license changed). Re-apply the
+  // database eligibility policy to the exact chunks being priced, so a stale
+  // retrieval result can never earn a new royalty allocation.
+  await assertChunksEligible(matchedChunks.map((c) => c.id));
 
   const quoteId = `q_${crypto.randomUUID()}`;
   const quoteNonce = crypto.randomBytes(16).toString('hex');

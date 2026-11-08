@@ -1,27 +1,147 @@
 /**
  * Retrieval evaluation framework for CiteRail.
  *
- * Compares three retrieval methods on a labelled evaluation dataset:
+ * Compares retrieval methods on a labelled evaluation dataset:
  *   1. Full-text search (FTS) only
- *   2. Semantic (vector) only
+ *   2. Semantic (vector) only   — only when an embedding provider is available
  *   3. Hybrid (FTS + semantic via RRF)
  *
  * Metrics: Recall@5, Recall@10, MRR@10, nDCG@10, empty-result count, latency.
+ * Latency is recorded separately from retrieval quality: quality metrics are
+ * only ever computed from real, non-empty, verifiable labels.
+ *
+ * If labels are missing, empty, or reference chunk IDs that do not exist in
+ * the corpus, the script prints
+ *   RETRIEVAL QUALITY: NOT EVALUATED
+ * and never fabricates zero-valued Recall/MRR/nDCG numbers or claims about
+ * hybrid retrieval outperforming FTS.
+ *
+ * Dataset sources:
+ *   - Operator-supplied JSON file via the RETRIEVAL_EVAL_DATASET environment
+ *     variable, with the schema:
+ *       { "queries": [ { "id": "eval_001", "query": "...",
+ *                        "relevantChunkIds": ["chk_..."] }, ... ] }
  *
  * Usage:
  *   npx tsx scripts/evaluate-retrieval.ts
- *
- * Requires DATABASE_URL and an embedding provider for semantic/hybrid paths.
  */
 
+import fs from 'fs';
 import { query, pool } from '../lib/db';
 import { searchKnowledgeCollections } from '../lib/retrieval';
 import { getEmbeddingProvider } from '../lib/embedding';
 
-interface EvalQuery {
+export interface EvalQuery {
   id: string;
   query: string;
   relevantChunkIds: string[];
+}
+
+export interface DatasetValidation {
+  valid: boolean;
+  problems: string[];
+  labelledQueryCount: number;
+}
+
+export const NOT_EVALUATED_HEADER = 'RETRIEVAL QUALITY: NOT EVALUATED';
+
+/**
+ * Validates that an evaluation dataset contains REAL labelled relevance
+ * judgements:
+ *   - at least one labelled query,
+ *   - every query has at least one relevant chunk ID,
+ *   - every referenced chunk ID exists in the evaluation corpus.
+ * Importantly, a query is not "evaluated" if its query text is missing.
+ */
+export function validateEvaluationDataset(
+  queries: EvalQuery[],
+  corpusChunkIds: Set<string>
+): DatasetValidation {
+  const problems: string[] = [];
+
+  if (!Array.isArray(queries) || queries.length === 0) {
+    return {
+      valid: false,
+      problems: ['Evaluation dataset is empty.'],
+      labelledQueryCount: 0,
+    };
+  }
+
+  let labelledQueryCount = 0;
+  for (const q of queries) {
+    if (!q || typeof q.query !== 'string' || !q.query.trim()) {
+      problems.push(`Query ${q?.id ?? '<missing id>'} has no query text.`);
+      continue;
+    }
+    if (!Array.isArray(q.relevantChunkIds) || q.relevantChunkIds.length === 0) {
+      problems.push(
+        `Query ${q.id} has no labelled relevantChunkIds; it cannot produce quality metrics.`
+      );
+      continue;
+    }
+    labelledQueryCount++;
+    for (const chunkId of q.relevantChunkIds) {
+      if (!corpusChunkIds.has(chunkId)) {
+        problems.push(
+          `Query ${q.id} references chunk ${chunkId} which does not exist in the corpus.`
+        );
+      }
+    }
+  }
+
+  if (queries.every((q) => !q || !Array.isArray(q.relevantChunkIds) || q.relevantChunkIds.length === 0)) {
+    problems.push(
+      'No queries carry labelled relevant chunk IDs. Quality metrics cannot be measured.'
+    );
+  }
+
+  return {
+    valid: problems.length === 0,
+    problems,
+    labelledQueryCount,
+  };
+}
+
+/**
+ * Renders the standard NOT EVALUATED banner with the concrete reasons.
+ */
+export function renderNotEvaluated(problems: string[]): string {
+  const lines = [NOT_EVALUATED_HEADER];
+  lines.push(
+    'Labelled evaluation data is missing or invalid, so no Recall, MRR, or ' +
+      'nDCG values are reported and no retrieval-quality claims are made.'
+  );
+  for (const p of problems) {
+    lines.push(`  - ${p}`);
+  }
+  lines.push(
+    "Populate an operator dataset (RETRIEVAL_EVAL_DATASET) with verified, " +
+      'existing chunk IDs to enable quality evaluation.'
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Loads the evaluation dataset. When RETRIEVAL_EVAL_DATASET points at a JSON
+ * file, that operator-supplied dataset is used; otherwise an empty dataset is
+ * returned (which always validates as NOT EVALUATED rather than inventing
+ * labels).
+ */
+export function loadEvaluationDataset(
+  envVar: string | undefined = process.env.RETRIEVAL_EVAL_DATASET
+): EvalQuery[] {
+  if (envVar && envVar.trim()) {
+    const path = envVar.trim();
+    const raw = fs.readFileSync(path, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.queries)) {
+      throw new Error(
+        `Evaluation dataset at ${path} must be JSON of shape { "queries": [...] }`
+      );
+    }
+    return parsed.queries as EvalQuery[];
+  }
+  return [];
 }
 
 interface EvalResult {
@@ -44,27 +164,6 @@ interface EvalResult {
     latencyMs: number;
   }>;
 }
-
-// Default evaluation dataset: small, reproducible set of test queries.
-// Each query has known relevant chunk IDs that must be populated by the
-// operator before running meaningful evaluation.
-const DEFAULT_QUERIES: EvalQuery[] = [
-  {
-    id: 'eval_001',
-    query: 'Turbine block propagation protocol',
-    relevantChunkIds: [],
-  },
-  {
-    id: 'eval_002',
-    query: 'Settlement verification payment',
-    relevantChunkIds: [],
-  },
-  {
-    id: 'eval_003',
-    query: 'Document royalty allocation pricing',
-    relevantChunkIds: [],
-  },
-];
 
 function reciprocalRank(rankedIds: string[], relevantIds: Set<string>, k: number): number {
   for (let i = 0; i < Math.min(k, rankedIds.length); i++) {
@@ -176,7 +275,7 @@ async function evaluateMethod(
     mrrAt10: Number((totalMRR10 / n).toFixed(4)),
     ndcgAt10: Number((totalNDCG10 / n).toFixed(4)),
     emptyResults: emptyCount,
-    avgLatencyMs: Number((totalLatency / n).toFixed(2)),
+    avgLatencyMs: n > 0 ? Number((totalLatency / n).toFixed(2)) : 0,
     perQuery,
   };
 }
@@ -185,38 +284,71 @@ async function main() {
   console.log('=== CiteRail Retrieval Evaluation ===');
   console.log('');
 
-  const provider = getEmbeddingProvider();
+  // Provider availability: an initialization failure is caught so that the
+  // report explicitly marks the SEMANTIC evaluation as not performed instead
+  // of crashing.
+  let provider: Awaited<ReturnType<typeof getEmbeddingProvider>> = null;
+  try {
+    provider = await getEmbeddingProvider();
+  } catch (err) {
+    console.error(
+      'Embedding provider initialization failed:',
+      err instanceof Error ? err.message : String(err)
+    );
+    provider = null;
+  }
   const hasEmbeddings = provider !== null;
-  console.log(`Embedding provider: ${hasEmbeddings ? provider!.providerId : 'none (FTS-only)'}`);
-  console.log(`Model: ${hasEmbeddings ? provider!.modelId : 'N/A'}`);
-  console.log(`Dimensions: ${hasEmbeddings ? provider!.dimensions : 'N/A'}`);
+  console.log(
+    `Embedding provider: ${
+      provider ? `${provider.providerId} (model ${provider.modelId}, digest ${provider.modelDigest})` : 'none (FTS-only)'
+    }`
+  );
   console.log('');
 
-  // Check if evaluation dataset has relevant chunk IDs populated.
-  const hasRelevantIds = DEFAULT_QUERIES.some((q) => q.relevantChunkIds.length > 0);
-  if (!hasRelevantIds) {
-    console.log(
-      'NOTE: No relevant chunk IDs are defined in the evaluation dataset. ' +
-        'Recall/MRR/nDCG metrics will be 0. Populate DEFAULT_QUERIES with ' +
-        'known relevant chunk IDs before running meaningful evaluation.'
-    );
+  const dataset = loadEvaluationDataset();
+  console.log(
+    `Evaluation dataset: ${
+      process.env.RETRIEVAL_EVAL_DATASET
+        ? `operator-supplied (${process.env.RETRIEVAL_EVAL_DATASET.trim()})`
+        : 'none supplied'
+    }`
+  );
+
+  // Labelled chunk IDs must actually exist in the corpus being evaluated.
+  const corpusRes = await query<{ id: string }>('SELECT id FROM document_chunks');
+  const corpusChunkIds = new Set(corpusRes.rows.map((r) => r.id));
+
+  const validation = validateEvaluationDataset(dataset, corpusChunkIds);
+  if (!validation.valid) {
     console.log('');
+    console.log(renderNotEvaluated(validation.problems));
+    console.log('');
+    await pool.end();
+    return;
   }
+
+  console.log(`Labelled queries: ${validation.labelledQueryCount}`);
+  console.log('');
 
   // Run FTS-only evaluation.
   console.log('Running FTS-only evaluation...');
-  const ftsResult = await evaluateMethod('FTS-only', DEFAULT_QUERIES, true, false);
+  const ftsResult = await evaluateMethod('FTS-only', dataset, true, false);
 
-  // Run semantic-only evaluation (if provider available).
+  // Run semantic-only evaluation only when a provider is actually available.
   let semanticResult: EvalResult | null = null;
   if (hasEmbeddings) {
     console.log('Running semantic-only evaluation...');
-    semanticResult = await evaluateMethod('Semantic-only', DEFAULT_QUERIES, false, true);
+    semanticResult = await evaluateMethod('Semantic-only', dataset, false, true);
+  } else {
+    console.log(
+      'Semantic evaluation was NOT performed: no embedding provider is configured or available.'
+    );
   }
 
-  // Run hybrid evaluation.
+  // Hybrid evaluation uses the same corpus and the same labels as every other
+  // run above, so the comparison is like-for-like.
   console.log('Running hybrid evaluation...');
-  const hybridResult = await evaluateMethod('Hybrid (FTS + semantic)', DEFAULT_QUERIES, false, false);
+  const hybridResult = await evaluateMethod('Hybrid (FTS + semantic)', dataset, false, false);
 
   console.log('');
   console.log('=== Evaluation Results ===');
@@ -238,13 +370,12 @@ async function main() {
   if (semanticResult) printResult(semanticResult);
   printResult(hybridResult);
 
-  // Comparison summary.
+  // Comparison summary — only ever stated when a semantic run actually took
+  // place and the labels stayed identical across methods.
   console.log('=== Comparison Summary ===');
   if (semanticResult) {
-    const hybridVsFtsRecall5 =
-      hybridResult.recallAt5 - ftsResult.recallAt5;
-    const hybridVsFtsMRR =
-      hybridResult.mrrAt10 - ftsResult.mrrAt10;
+    const hybridVsFtsRecall5 = hybridResult.recallAt5 - ftsResult.recallAt5;
+    const hybridVsFtsMRR = hybridResult.mrrAt10 - ftsResult.mrrAt10;
     console.log(
       `Hybrid vs FTS Recall@5 delta: ${hybridVsFtsRecall5 > 0 ? '+' : ''}${hybridVsFtsRecall5}`
     );
@@ -259,11 +390,13 @@ async function main() {
       );
     }
   } else {
-    console.log('Semantic evaluation skipped (no embedding provider).');
+    console.log(
+      'Hybrid comparison NOT made: semantic evaluation was not performed (no embedding provider).'
+    );
   }
 
   console.log('');
-  console.log('Per-query details:');
+  console.log('Per-query details (latency recorded separately from quality):');
   for (const entry of hybridResult.perQuery) {
     console.log(
       `  ${entry.queryId} "${entry.query}": R@5=${entry.recallAt5} R@10=${entry.recallAt10} MRR@10=${entry.mrrAt10} nDCG@10=${entry.ndcgAt10} lat=${entry.latencyMs}ms`
@@ -273,7 +406,15 @@ async function main() {
   await pool.end();
 }
 
-main().catch((err) => {
-  console.error('Evaluation failed:', err);
-  process.exit(1);
-});
+// Only run main when executed directly (not when imported by tests).
+const isMainModule =
+  typeof require !== 'undefined' &&
+  typeof module !== 'undefined' &&
+  require.main === module;
+
+if (isMainModule) {
+  main().catch((err) => {
+    console.error('Evaluation failed:', err);
+    process.exit(1);
+  });
+}

@@ -1,6 +1,6 @@
 import { query } from './db';
 import { ChunkRecord } from './documents';
-import { getEmbeddingProvider } from './embedding';
+import { getEmbeddingProvider, EmbeddingProvider } from './embedding';
 import { ELIGIBILITY_SQL_PREDICATE } from './eligibility';
 
 /**
@@ -122,14 +122,17 @@ async function ftsRetrieval(
  * Semantic retrieval path using pgvector cosine distance.
  * Returns ranked candidates ordered by similarity (most similar first).
  * Applies the same eligibility predicate as the FTS path.
+ *
+ * Only embeddings whose (provider, model_id, dimensions, model_digest) tuple
+ * matches the verified identity of the CURRENT provider instance are
+ * considered. Legacy rows with unknown digests can never silently satisfy
+ * semantic retrieval.
  */
 async function semanticRetrieval(
+  provider: EmbeddingProvider,
   queryVector: number[],
   limit: number
 ): Promise<RankedCandidate[]> {
-  const provider = getEmbeddingProvider();
-  if (!provider) return [];
-
   const sql = `
     SELECT
       c.id,
@@ -165,7 +168,7 @@ async function semanticRetrieval(
     provider.providerId,
     provider.modelId,
     provider.dimensions,
-    '', // model_digest: Ollama embed API does not return a digest
+    provider.modelDigest,
     limit,
   ]);
 
@@ -264,20 +267,23 @@ export async function searchKnowledgeCollections(
   }
 
   // Path 2: Semantic retrieval (runs unless ftsOnly; degrades gracefully).
+  // Provider initialization itself lives inside the failure handler: an
+  // invalid embedding configuration (or an unresolvable model identity) must
+  // never prevent the FTS path from operating.
   let semanticCandidates: RankedCandidate[] = [];
   if (!ftsOnly) {
-    const provider = getEmbeddingProvider();
-    if (provider) {
-      try {
+    try {
+      const provider = await getEmbeddingProvider();
+      if (provider) {
         const queryVector = await provider.embedQuery(cleanQuery);
-        semanticCandidates = await semanticRetrieval(queryVector, candidateLimit);
-      } catch (err) {
-        // Embedding failure is non-fatal: FTS results are still returned.
-        console.error(
-          'Semantic retrieval failed, falling back to FTS:',
-          err instanceof Error ? err.message : String(err)
-        );
+        semanticCandidates = await semanticRetrieval(provider, queryVector, candidateLimit);
       }
+    } catch (err) {
+      // Embedding failure is non-fatal: FTS results are still returned.
+      console.error(
+        'Semantic retrieval failed, falling back to FTS:',
+        err instanceof Error ? err.message : String(err)
+      );
     }
   }
 
@@ -288,12 +294,20 @@ export async function searchKnowledgeCollections(
 
   const fused = rrfFuse(paths, RRF_K);
 
-  // Sort by fused score descending, then by chunk_index for deterministic tie-breaking.
+  // Sort by fused score descending, then fully deterministic tie-breaking:
+  // chunk_index ascending, then document_id ascending, then chunk_id
+  // ascending. Repeated runs over equal-scoring candidates always produce
+  // identical ordering.
   const sorted = Array.from(fused.values()).sort((a, b) => {
     if (b.fusedScore !== a.fusedScore) {
       return b.fusedScore - a.fusedScore;
     }
-    return a.chunk.chunk_index - b.chunk.chunk_index;
+    if (a.chunk.chunk_index !== b.chunk.chunk_index) {
+      return a.chunk.chunk_index - b.chunk.chunk_index;
+    }
+    const docCompare = a.chunk.document_id.localeCompare(b.chunk.document_id);
+    if (docCompare !== 0) return docCompare;
+    return a.chunk.id.localeCompare(b.chunk.id);
   });
 
   // Take the top `limit` results.

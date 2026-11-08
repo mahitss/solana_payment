@@ -5,9 +5,25 @@
  * provider (lib/ai/provider.ts). Embeddings are used only for retrieval
  * candidate ranking; no publisher source text is sent to any external provider
  * by default.
+ *
+ * Model identity: every provider instance exposes a validated, immutable
+ * model digest. The digest is resolved from the provider itself (for Ollama,
+ * the digest of the exact configured model from GET /api/tags) and is bound
+ * to the provider instance for its whole lifetime. Embedding writes and
+ * semantic retrieval always use the same provider/model/digest identity, so a
+ * model update can never silently make old vectors appear to belong to the
+ * new model. When a genuine fingerprint cannot be established, provider
+ * resolution fails closed and retrieval stays on full-text search.
  */
 
 import { config } from './config';
+
+/**
+ * Normalized digest prefix. Every stored digest is normalized to this form so
+ * provider quirks (sha256- vs sha256- vs bare hex) cannot create phantom
+ * model versions.
+ */
+export const DIGEST_PREFIX = 'sha256:';
 
 /**
  * Result of embedding a single text.
@@ -17,8 +33,8 @@ export interface EmbeddingResult {
   vector: number[];
   /** The model identifier actually used. */
   modelId: string;
-  /** The model digest/fingerprint when available from the provider. */
-  modelDigest?: string;
+  /** The validated immutable model digest actually used. */
+  modelDigest: string;
   /** Provider identifier (e.g. "ollama"). */
   provider: string;
 }
@@ -26,11 +42,18 @@ export interface EmbeddingResult {
 /**
  * Abstract embedding provider. Implementations must be deterministic for the
  * same input text so that re-embedding a chunk produces the same vector.
+ *
+ * Every instance must be constructed with a verified model digest: an
+ * EmbeddingProvider without a genuine, validated fingerprint refuses to
+ * exist. Callers therefore cannot accidentally index into an unidentified
+ * model version.
  */
 export interface EmbeddingProvider {
   readonly providerId: string;
   readonly modelId: string;
   readonly dimensions: number;
+  /** Validated immutable model fingerprint (normalized to `sha256:<hex64>`). */
+  readonly modelDigest: string;
 
   /**
    * Embed multiple texts in a single batch request when the provider supports
@@ -46,7 +69,8 @@ export interface EmbeddingProvider {
 }
 
 /**
- * Validation error thrown when an embedding response is malformed.
+ * Validation error thrown when an embedding response is malformed or the
+ * model identity cannot be verified.
  */
 export class EmbeddingProviderError extends Error {
   code: string;
@@ -94,6 +118,184 @@ function validateVector(
   return result;
 }
 
+const HEX_64_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Normalizes a provider-reported model digest to `sha256:<64 lowercase hex>`.
+ *
+ * Accepted input forms (Ollama has used each of these shape across versions):
+ *   - "sha256:<hex64>"
+ *   - "sha256-<hex64>"
+ *   - "<hex64>"
+ *
+ * Anything else (missing, empty, wrong length, non-hex, opaque identifiers)
+ * is rejected: a fabricated or mutable alias is never a valid model identity.
+ */
+export function normalizeModelDigest(raw: unknown): string {
+  if (typeof raw !== 'string') {
+    throw new EmbeddingProviderError(
+      'Model digest is missing from the provider response',
+      'MODEL_DIGEST_MALFORMED'
+    );
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new EmbeddingProviderError(
+      'Model digest is empty',
+      'MODEL_DIGEST_MALFORMED'
+    );
+  }
+  let hex: string;
+  if (trimmed.startsWith('sha256:')) {
+    hex = trimmed.slice('sha256:'.length);
+  } else if (trimmed.startsWith('sha256-')) {
+    hex = trimmed.slice('sha256-'.length);
+  } else {
+    hex = trimmed;
+  }
+  hex = hex.toLowerCase();
+  if (!HEX_64_RE.test(hex)) {
+    throw new EmbeddingProviderError(
+      `Model digest "${raw}" is not a valid sha256 fingerprint (64 hex characters required)`,
+      'MODEL_DIGEST_MALFORMED'
+    );
+  }
+  return `${'sha256:' + hex}`;
+}
+
+/**
+ * Resolves the digest of the exact configured model from Ollama's
+ * `GET /api/tags` endpoint.
+ *
+ * Matching rules (precise, no guessing):
+ *   - A configured model WITH a tag (e.g. "embeddinggemma:q8") must match an
+ *     entry name exactly; otherwise the model is not found.
+ *   - A configured model WITHOUT a tag (e.g. "embeddinggemma") resolves the
+ *     same way Ollama resolves it: to "<name>:latest" when that tag exists
+ *     exactly once and no other "<name>:*" tag is present.
+ *   - Multiple "<name>:*" tags without an exact name match are ambiguous and
+ *     rejected rather than guessed.
+ *
+ * Errors (all fail closed):
+ *   - MODEL_DIGEST_UNAVAILABLE: endpoint unreachable or non-2xx response.
+ *   - MODEL_NOT_FOUND: configured model name does not match any entry.
+ *   - MODEL_DIGEST_MALFORMED: response shape invalid or digest not sha256.
+ *   - MODEL_AMBIGUOUS: untagged model name is ambiguous among known tags.
+ *
+ * `fetchImpl` can be injected for tests; defaults to the global fetch.
+ */
+export async function resolveOllamaModelDigest(
+  baseUrl: string,
+  modelId: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = 10_000
+): Promise<string> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  let response: Response;
+  let bodyText: string;
+  try {
+    response = await fetchImpl(`${baseUrl.replace(/\/$/, '')}/api/tags`, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    bodyText = await response.text();
+  } catch (err) {
+    if (timedOut || (err as any)?.name === 'AbortError') {
+      throw new EmbeddingProviderError(
+        `Resolving model digest timed out after ${timeoutMs}ms`,
+        'MODEL_DIGEST_UNAVAILABLE'
+      );
+    }
+    throw new EmbeddingProviderError(
+      `Resolving model digest failed: ${err instanceof Error ? err.message : String(err)}`,
+      'MODEL_DIGEST_UNAVAILABLE'
+    );
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    throw new EmbeddingProviderError(
+      `Model digest lookup failed with status ${response.status}`,
+      'MODEL_DIGEST_UNAVAILABLE'
+    );
+  }
+
+  let tagsBody: any;
+  try {
+    tagsBody = JSON.parse(bodyText);
+  } catch {
+    throw new EmbeddingProviderError(
+      'Model digest lookup response is not valid JSON',
+      'MODEL_DIGEST_MALFORMED'
+    );
+  }
+  if (!tagsBody || !Array.isArray(tagsBody.models)) {
+    throw new EmbeddingProviderError(
+      'Model digest lookup response is missing a models array',
+      'MODEL_DIGEST_MALFORMED'
+    );
+  }
+
+  type TagEntry = { name: string; digest: string };
+  const entries: TagEntry[] = [];
+  for (const m of tagsBody.models) {
+    if (!m || typeof m.name !== 'string' || !m.name.trim()) {
+      throw new EmbeddingProviderError(
+        'Model digest lookup response contains a model entry without a name',
+        'MODEL_DIGEST_MALFORMED'
+      );
+    }
+    if (m.digest === undefined || m.digest === null) {
+      throw new EmbeddingProviderError(
+        `Model "${m.name}" is listed without a digest`,
+        'MODEL_DIGEST_MALFORMED'
+      );
+    }
+    // normalizeModelDigest throws MODEL_DIGEST_MALFORMED when malformed.
+    entries.push({
+      name: m.name,
+      digest: normalizeModelDigest(m.digest),
+    });
+  }
+
+  const exact = entries.find((e) => e.name === modelId);
+  if (exact) return exact.digest;
+
+  const colonIndex = modelId.indexOf(':');
+  if (colonIndex !== -1) {
+    throw new EmbeddingProviderError(
+      `Configured embedding model "${modelId}" is not available on the endpoint`,
+      'MODEL_NOT_FOUND'
+    );
+  }
+
+  const prefixed = `${modelId}:`;
+  const candidates = entries.filter((e) => e.name.startsWith(prefixed));
+  if (candidates.length === 0) {
+    throw new EmbeddingProviderError(
+      `Configured embedding model "${modelId}" is not available on the endpoint`,
+      'MODEL_NOT_FOUND'
+    );
+  }
+  const latest = candidates.find((e) => e.name === `${modelId}:latest`);
+  if (candidates.length > 1 || !latest) {
+    throw new EmbeddingProviderError(
+      `Configured embedding model "${modelId}" is ambiguous across tags (${candidates
+        .map((c) => c.name)
+        .join(', ')}); configure the exact tag.`,
+      'MODEL_AMBIGUOUS'
+    );
+  }
+  return latest.digest;
+}
+
 /**
  * Ollama embedding provider using the `/api/embed` endpoint.
  *
@@ -106,14 +308,44 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
   readonly providerId = 'ollama';
   readonly modelId: string;
   readonly dimensions: number;
+  /** Validated immutable model fingerprint bound at construction time. */
+  readonly modelDigest: string;
+
   private readonly baseUrl: string;
 
   private static readonly MAX_BATCH_SIZE = 64;
+  private static readonly HEX_DIGEST_RE = /^[0-9a-f]{64}$/;
 
-  constructor(baseUrl: string, modelId: string, dimensions: number) {
+  constructor(baseUrl: string, modelId: string, dimensions: number, modelDigest: string) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.modelId = modelId;
     this.dimensions = dimensions;
+    let normalized: string;
+    if (typeof modelDigest !== 'string' || !modelDigest.trim()) {
+      throw new EmbeddingProviderError(
+        'Embedding provider construction refused: model digest is empty',
+        'MODEL_DIGEST_MALFORMED'
+      );
+    }
+    try {
+      normalized = normalizeModelDigest(modelDigest);
+    } catch (err) {
+      throw new EmbeddingProviderError(
+        `Embedding provider construction refused: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        'MODEL_DIGEST_MALFORMED'
+      );
+    }
+    // Double-check the normalization produced a genuine sha256 fingerprint.
+    const hex = normalized.slice(DIGEST_PREFIX.length);
+    if (!OllamaEmbeddingProvider.HEX_DIGEST_RE.test(hex)) {
+      throw new EmbeddingProviderError(
+        'Embedding provider construction refused: normalized digest is not sha256 hex',
+        'MODEL_DIGEST_MALFORMED'
+      );
+    }
+    this.modelDigest = normalized;
   }
 
   /**
@@ -145,7 +377,8 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
         return await this.embedBatchOnce(texts);
       } catch (err: any) {
         if (attempt === maxRetries) throw err;
-        // Only retry on transient/connection errors, not on validation errors.
+        // Only retry on transient/connectivity failures. Permanent
+        // configuration, identity, and validation errors are never retried.
         if (
           err instanceof EmbeddingProviderError &&
           (err.code === 'MODEL_NOT_FOUND' ||
@@ -167,29 +400,42 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
     );
   }
 
+  /**
+   * Single-request embedding call with ONE clean timeout lifecycle:
+   *
+   * - A single AbortController timer covers connecting, response headers,
+   *   body reading, and JSON parsing.
+   * - The abort signal terminates the in-flight body when a response stalls.
+   * - The timer is always cleared in the finally path: no orphaned timeout
+   *   promises and no leaked timers after success, failure, or timeout.
+   * - Invalid JSON and wrong vector counts stay explicit validation errors,
+   *   never reclassified as timeouts.
+   */
   private async embedBatchOnce(texts: string[]): Promise<number[][]> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), config.aiRequestTimeoutMs);
+    let timedOut = false;
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, config.aiRequestTimeoutMs);
 
     let response: Response;
+    let bodyText: string;
     try {
-      response = await Promise.race([
-        fetch(`${this.baseUrl}/api/embed`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: this.modelId,
-            input: texts,
-          }),
-          signal: controller.signal,
+      response = await fetch(`${this.baseUrl}/api/embed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: this.modelId,
+          input: texts,
         }),
-        new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('timeout')), config.aiRequestTimeoutMs);
-        }),
-      ]) as Response;
+        signal: controller.signal,
+      });
+      // Body reading happens while the timeout is still live; a stalled
+      // response body is aborted (and treated as a timeout) by the controller.
+      bodyText = await response.text();
     } catch (err: any) {
-      clearTimeout(timeoutId);
-      if (err.name === 'AbortError' || err.message === 'timeout') {
+      if (timedOut || err?.name === 'AbortError') {
         throw new EmbeddingProviderError(
           `Ollama embed request timed out after ${config.aiRequestTimeoutMs}ms`,
           'EMBEDDING_TIMEOUT'
@@ -199,38 +445,26 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
         `Ollama embed request failed: ${err instanceof Error ? err.message : String(err)}`,
         'OLLAMA_REQUEST_FAILED'
       );
-    }
-
-    // Keep the timeout active through body reading and validation.
-    let errorText = '';
-    try {
-      errorText = await response.text();
-    } catch (err: any) {
+    } finally {
       clearTimeout(timeoutId);
-      throw new EmbeddingProviderError(
-        `Failed to read Ollama response body: ${err instanceof Error ? err.message : String(err)}`,
-        'OLLAMA_READ_FAILED'
-      );
     }
-
-    clearTimeout(timeoutId);
 
     if (!response.ok) {
-      if (response.status === 404 || errorText.includes('model not found')) {
+      if (response.status === 404 || bodyText.includes('model not found')) {
         throw new EmbeddingProviderError(
           `Ollama model not found: ${this.modelId}`,
           'MODEL_NOT_FOUND'
         );
       }
       throw new EmbeddingProviderError(
-        `Ollama embed request failed with status ${response.status}: ${errorText}`,
+        `Ollama embed request failed with status ${response.status}: ${bodyText}`,
         'OLLAMA_REQUEST_FAILED'
       );
     }
 
     let body: any;
     try {
-      body = JSON.parse(errorText);
+      body = JSON.parse(bodyText);
     } catch {
       throw new EmbeddingProviderError(
         'Ollama embed response is not valid JSON',
@@ -294,14 +528,38 @@ export class OllamaEmbeddingProvider implements EmbeddingProvider {
 }
 
 /**
+ * Creates an Ollama provider whose model identity has been verified against
+ * the endpoint's own /api/tags listing. Refuses to construct anything when
+ * the digest cannot be verified.
+ *
+ * `fetchImpl` can be injected for tests; defaults to the global fetch.
+ */
+export async function createOllamaEmbeddingProvider(
+  baseUrl: string,
+  modelId: string,
+  dimensions: number,
+  fetchImpl: typeof fetch = fetch
+): Promise<OllamaEmbeddingProvider> {
+  const digest = await resolveOllamaModelDigest(baseUrl, modelId, fetchImpl);
+  return new OllamaEmbeddingProvider(baseUrl, modelId, dimensions, digest);
+}
+
+/**
  * Factory for creating the configured embedding provider.
  *
  * Reads EMBEDDING_PROVIDER (default "ollama") and related env vars.
- * Returns null when no embedding provider is configured, in which case
- * retrieval falls back to full-text search only.
+ * Returns null for deliberately disabled/unknown provider selections.
+ * Throws an EmbeddingProviderError when an ollama configuration is present
+ * but the model identity cannot be verified (fail closed). Callers in
+ * retrieval/ingestion catch that error, report it accurately, and keep
+ * full-text search fully operational.
+ *
+ * A fetchImpl can be injected for tests; defaults to the global fetch.
  */
-export function createEmbeddingProvider(): EmbeddingProvider | null {
-  const provider = (process.env.EMBEDDING_PROVIDER || 'ollama').toLowerCase();
+export async function resolveEmbeddingProvider(
+  fetchImpl?: typeof fetch
+): Promise<EmbeddingProvider | null> {
+  const provider = config.embeddingProvider.toLowerCase();
 
   if (provider === 'none') {
     console.info(
@@ -325,33 +583,76 @@ export function createEmbeddingProvider(): EmbeddingProvider | null {
   const dimensions = config.embeddingDimensions;
 
   if (!Number.isFinite(dimensions) || dimensions <= 0) {
-    throw new Error(
-      `EMBEDDING_DIMENSIONS must be a positive integer, received "${config.embeddingDimensions}"`
+    throw new EmbeddingProviderError(
+      `EMBEDDING_DIMENSIONS must be a positive integer, received "${config.embeddingDimensions}"`,
+      'INVALID_EMBEDDING_CONFIG'
     );
   }
 
   console.info(
     `[embedding] Using Ollama provider: baseUrl=${baseUrl} model=${modelId} dimensions=${dimensions}`
   );
-  return new OllamaEmbeddingProvider(baseUrl, modelId, dimensions);
+  return createOllamaEmbeddingProvider(baseUrl, modelId, dimensions, fetchImpl ?? fetch);
 }
 
 /**
- * Singleton provider instance. Lazily initialized.
+ * Singleton provider state.
+ *
+ * `resolvedProvider` caches only settled results (provider instance or null).
+ * A rejected resolution is NOT cached: the next caller retries resolution,
+ * which keeps a temporarily unavailable endpoint from permanently disabling
+ * semantic retrieval for the process lifetime.
  */
-let embeddingProviderInstance: EmbeddingProvider | null | undefined = undefined;
+let resolvedProvider: EmbeddingProvider | null | undefined = undefined;
+let pendingResolution: Promise<EmbeddingProvider | null> | undefined = undefined;
 
-export function getEmbeddingProvider(): EmbeddingProvider | null {
-  if (embeddingProviderInstance === undefined) {
-    embeddingProviderInstance = createEmbeddingProvider();
+/**
+ * Test-only dependency injection. When set to a function it replaces provider
+ * resolution entirely (may return a provider, null, or throw, e.g. to
+ * simulate an initialization failure without any network access). Set to
+ * undefined to restore normal resolution.
+ */
+let providerOverrideFn: (() => EmbeddingProvider | null | Promise<EmbeddingProvider | null>) | undefined =
+  undefined;
+
+export async function getEmbeddingProvider(): Promise<EmbeddingProvider | null> {
+  if (providerOverrideFn) {
+    return providerOverrideFn();
   }
-  return embeddingProviderInstance;
+  if (resolvedProvider !== undefined) {
+    return resolvedProvider;
+  }
+  if (!pendingResolution) {
+    pendingResolution = resolveEmbeddingProvider();
+  }
+  try {
+    const provider = await pendingResolution;
+    resolvedProvider = provider;
+    return provider;
+  } catch (err) {
+    // Explicit initialization failure. Clear the cached rejection so the next
+    // caller retries rather than being stuck on a stale failure.
+    pendingResolution = undefined;
+    throw err;
+  }
 }
 
 /**
- * Resets the singleton provider instance. Used by tests to simulate
+ * Resets the singleton provider instance and cache. Used by tests to simulate
  * different configurations without relying on environment variable ordering.
  */
 export function resetEmbeddingProvider(): void {
-  embeddingProviderInstance = undefined;
+  resolvedProvider = undefined;
+  pendingResolution = undefined;
+  providerOverrideFn = undefined;
+}
+
+/**
+ * Sets a test-only provider override without dropping the whole reset
+ * contract. Calling with `null` restores normal resolution behavior.
+ */
+export function setEmbeddingProviderOverride(
+  fn: (() => EmbeddingProvider | null | Promise<EmbeddingProvider | null>) | null
+): void {
+  providerOverrideFn = fn ?? undefined;
 }
