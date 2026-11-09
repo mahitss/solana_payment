@@ -112,22 +112,30 @@ export async function loadEligibleChunksForQuote(
   return res.rows;
 }
 
-export async function createPaymentQuote(
+/**
+ * Internal transaction workflow shared by production quote creation and
+ * concurrency integration tests. Performs all authoritative source validation,
+ * eligibility, pricing, quote insertion, and source snapshot insertion inside
+ * a single PostgreSQL transaction with FOR SHARE row locks.
+ *
+ * If `pauseBeforeInsert` is set (test-only), the transaction pauses after
+ * acquiring FOR SHARE locks and before inserting quote/snapshot rows. The
+ * hook receives a `release` function; the transaction continues when
+ * `release()` is called.
+ */
+export async function runQuoteTransaction(
+  client: PoolClient,
   queryText: string,
   matchedChunks: ChunkRecord[],
-  buyerWallet: string | null = null,
-  expirySeconds: number = config.quoteExpirySeconds
-): Promise<PaymentQuote> {
-  if (matchedChunks.length === 0) {
-    throw new Error('Cannot create quote with zero matched chunks.');
-  }
-
-  // matchedChunks is used only to identify the requested chunk IDs and to
-  // preserve their intended ordering. All authoritative data (price, wallet,
-  // publisher identity, document title, content, hashes) is loaded from the
-  // database inside the transaction below. Caller-supplied metadata is never
-  // trusted as a source of truth for pricing or allocation.
-
+  buyerWallet: string | null,
+  expirySeconds: number,
+  pauseBeforeInsert?: (release: () => void) => void
+): Promise<{
+  quoteRow: any;
+  publisherBreakdown: PublisherPaymentBreakdown[];
+  totalBaseUnits: bigint;
+  totalPriceUsdc: string;
+}> {
   const requestedIds = matchedChunks.map((c) => c.id);
 
   // Reject duplicate chunk IDs up front: a chunk must be priced once per quote.
@@ -148,200 +156,231 @@ export async function createPaymentQuote(
   let publisherBreakdown: PublisherPaymentBreakdown[] = [];
   let totalBaseUnits: bigint = BigInt(0);
   let totalPriceUsdc: string = '0.000000';
-  let sourceDigest: string = '';
-  let memoExpected: string = '';
 
-  // All authoritative source validation, eligibility, pricing, and quote
-  // construction happen inside a single PostgreSQL transaction with row locks.
-  // This closes the time-of-check/time-of-use window where a source could be
-  // revoked or its price/metadata changed between eligibility and commit.
-  const result = await withTransaction(async (client) => {
-    // 1. Load authoritative chunk/document/publisher records, applying the
-    //    full eligibility predicate and locking the rows for this transaction.
-    const authoritative = await loadEligibleChunksForQuote(
-      client,
-      uniqueRequestedIds
-    );
-    const byId = new Map(authoritative.map((c) => [c.id, c]));
+  // 1. Load authoritative chunk/document/publisher records, applying the
+  //    full eligibility predicate and locking the rows for this transaction.
+  const authoritative = await loadEligibleChunksForQuote(
+    client,
+    uniqueRequestedIds
+  );
+  const byId = new Map(authoritative.map((c) => [c.id, c]));
 
-    // 2. Confirm every requested chunk was returned eligible.
-    const missing = uniqueRequestedIds.filter((id) => !byId.has(id));
-    if (missing.length > 0) {
-      throw new IneligibleSourceError(missing);
-    }
+  // 2. Confirm every requested chunk was returned eligible.
+  const missing = uniqueRequestedIds.filter((id) => !byId.has(id));
+  if (missing.length > 0) {
+    throw new IneligibleSourceError(missing);
+  }
 
-    // 3. Build the publisher payment breakdown from canonical DB values,
-    //    preserving the requested chunk order.
-    const breakdownMap = new Map<string, PublisherPaymentBreakdown>();
-    const orderedAuthoritative: ChunkRecord[] = [];
-    for (const id of uniqueRequestedIds) {
-      orderedAuthoritative.push(byId.get(id)!);
-    }
+  // 3. Build the publisher payment breakdown from canonical DB values,
+  //    preserving the requested chunk order.
+  const breakdownMap = new Map<string, PublisherPaymentBreakdown>();
+  const orderedAuthoritative: ChunkRecord[] = [];
+  for (const id of uniqueRequestedIds) {
+    orderedAuthoritative.push(byId.get(id)!);
+  }
 
-    for (const chunk of orderedAuthoritative) {
-      const key = chunk.publisher_wallet;
-      let entry = breakdownMap.get(key);
+  for (const chunk of orderedAuthoritative) {
+    const key = chunk.publisher_wallet;
+    let entry = breakdownMap.get(key);
 
-      if (!entry) {
-        const baseUnits = parseNumericPrice(chunk.price_per_query_usdc);
-        if (baseUnits > MAX_PRICE_USDC) {
-          throw new Error(
-            `Price for document ${chunk.document_id} exceeds maximum of ${
-              MAX_PRICE_USDC / USDC_BASE_UNIT
-            } USDC.`
-          );
-        }
-
-        entry = {
-          publisher_id: chunk.publisher_id,
-          publisher_wallet: chunk.publisher_wallet,
-          publisher_name: chunk.publisher_name,
-          documents: [
-            {
-              document_id: chunk.document_id,
-              document_title: chunk.document_title,
-              chunk_ids: [chunk.id],
-              amount_base_units: baseUnits,
-              amount_usdc: fromBaseUnits(baseUnits),
-            },
-          ],
-          amount_base_units: baseUnits,
-          amount_usdc: fromBaseUnits(baseUnits),
-        };
-        breakdownMap.set(key, entry);
-        continue;
-      }
-
-      const docContribution = entry.documents.find(
-        (d) => d.document_id === chunk.document_id
-      );
-      if (!docContribution) {
-        const baseUnits = parseNumericPrice(chunk.price_per_query_usdc);
-        if (baseUnits > MAX_PRICE_USDC) {
-          throw new Error(
-            `Price for document ${chunk.document_id} exceeds maximum of ${
-              MAX_PRICE_USDC / USDC_BASE_UNIT
-            } USDC.`
-          );
-        }
-        entry.documents.push({
-          document_id: chunk.document_id,
-          document_title: chunk.document_title,
-          chunk_ids: [chunk.id],
-          amount_base_units: baseUnits,
-          amount_usdc: fromBaseUnits(baseUnits),
-        });
-        entry.amount_base_units += baseUnits;
-        entry.amount_usdc = fromBaseUnits(entry.amount_base_units);
-      } else {
-        docContribution.chunk_ids.push(chunk.id);
-      }
-    }
-
-    publisherBreakdown = Array.from(breakdownMap.values());
-
-    // All money is summed in integer base units so the total can never drift
-    // from the sum of its parts.
-    totalBaseUnits = publisherBreakdown.reduce(
-      (sum: bigint, p) => sum + p.amount_base_units,
-      BigInt(0)
-    );
-    totalPriceUsdc = fromBaseUnits(totalBaseUnits);
-
-    // Digest over the canonical chunk hashes that were priced.
-    sourceDigest = computeSourceDigest(
-      orderedAuthoritative.map((c) => c.content_hash)
-    );
-    memoExpected = buildMemoPayload({
-      quoteId,
-      quoteNonce,
-      sourceDigest,
-    });
-
-    // 4. Insert the quote inside the same transaction.
-    const insertSql = `
-      INSERT INTO payment_quotes (
-        id, quote_nonce, query_text, matched_chunk_ids, publisher_breakdown,
-        total_price_usdc, memo_expected, buyer_wallet, expires_at, status
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING')
-      RETURNING *;
-    `;
-
-    const res = await client.query(insertSql, [
-      quoteId,
-      quoteNonce,
-      queryText,
-      JSON.stringify(uniqueRequestedIds),
-      JSON.stringify(
-        publisherBreakdown.map((p) => ({
-          ...p,
-          amount_base_units: p.amount_base_units.toString(),
-          documents: p.documents.map((d) => ({
-            ...d,
-            amount_base_units: d.amount_base_units.toString(),
-          })),
-        }))
-      ),
-      formatUsdc(totalBaseUnits),
-      memoExpected,
-      buyerWallet,
-      expiresAt,
-    ]);
-
-    // 5. Insert immutable source snapshots inside the same transaction.
-    //    Content, hash, and price all come from the canonical DB record.
-    const sourceInsertSql = `
-      INSERT INTO payment_quote_sources (
-        id, quote_id, ordinal, chunk_id, document_id, publisher_id,
-        publisher_wallet, document_title, source_content, source_sha256,
-        document_price_base_units
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    `;
-
-    let ordinal = 0;
-    for (const chunk of orderedAuthoritative) {
-      // Recalculate SHA-256 from current DB content and reject if it doesn't
-      // match the stored content_hash.
-      const recalculatedHash = computeSha256(chunk.content);
-      if (recalculatedHash !== chunk.content_hash) {
+    if (!entry) {
+      const baseUnits = parseNumericPrice(chunk.price_per_query_usdc);
+      if (baseUnits > MAX_PRICE_USDC) {
         throw new Error(
-          `Source integrity check failed for chunk ${chunk.id}: content hash mismatch. Stored hash ${chunk.content_hash} does not match recomputed hash ${recalculatedHash}.`
+          `Price for document ${chunk.document_id} exceeds maximum of ${
+            MAX_PRICE_USDC / USDC_BASE_UNIT
+          } USDC.`
         );
       }
 
-      await client.query(sourceInsertSql, [
-        `src_${crypto.randomUUID()}`,
-        quoteId,
-        ordinal++,
-        chunk.id,
-        chunk.document_id,
-        chunk.publisher_id,
-        chunk.publisher_wallet,
-        chunk.document_title,
-        chunk.content,
-        recalculatedHash,
-        BigInt(parseNumericPrice(chunk.price_per_query_usdc)),
-      ]);
+      entry = {
+        publisher_id: chunk.publisher_id,
+        publisher_wallet: chunk.publisher_wallet,
+        publisher_name: chunk.publisher_name,
+        documents: [
+          {
+            document_id: chunk.document_id,
+            document_title: chunk.document_title,
+            chunk_ids: [chunk.id],
+            amount_base_units: baseUnits,
+            amount_usdc: fromBaseUnits(baseUnits),
+          },
+        ],
+        amount_base_units: baseUnits,
+        amount_usdc: fromBaseUnits(baseUnits),
+      };
+      breakdownMap.set(key, entry);
+      continue;
     }
 
-    return res.rows[0];
+    const docContribution = entry.documents.find(
+      (d) => d.document_id === chunk.document_id
+    );
+    if (!docContribution) {
+      const baseUnits = parseNumericPrice(chunk.price_per_query_usdc);
+      if (baseUnits > MAX_PRICE_USDC) {
+        throw new Error(
+          `Price for document ${chunk.document_id} exceeds maximum of ${
+            MAX_PRICE_USDC / USDC_BASE_UNIT
+          } USDC.`
+        );
+      }
+      entry.documents.push({
+        document_id: chunk.document_id,
+        document_title: chunk.document_title,
+        chunk_ids: [chunk.id],
+        amount_base_units: baseUnits,
+        amount_usdc: fromBaseUnits(baseUnits),
+      });
+      entry.amount_base_units += baseUnits;
+      entry.amount_usdc = fromBaseUnits(entry.amount_base_units);
+    } else {
+      docContribution.chunk_ids.push(chunk.id);
+    }
+  }
+
+  publisherBreakdown = Array.from(breakdownMap.values());
+
+  // All money is summed in integer base units so the total can never drift
+  // from the sum of its parts.
+  totalBaseUnits = publisherBreakdown.reduce(
+    (sum: bigint, p) => sum + p.amount_base_units,
+    BigInt(0)
+  );
+  totalPriceUsdc = fromBaseUnits(totalBaseUnits);
+
+  // Digest over the canonical chunk hashes that were priced.
+  const sourceDigest = computeSourceDigest(
+    orderedAuthoritative.map((c) => c.content_hash)
+  );
+  const memoExpected = buildMemoPayload({
+    quoteId,
+    quoteNonce,
+    sourceDigest,
   });
 
-  const quoteRow = result;
+  // Test-only pause: freeze after FOR SHARE locks are acquired, before
+  // inserting quote/snapshot rows. The transaction holds its locks while
+  // paused, allowing concurrency tests to observe real PostgreSQL blocking.
+  if (pauseBeforeInsert) {
+    await new Promise<void>((resolve) => {
+      pauseBeforeInsert(resolve);
+    });
+  }
+
+  // 4. Insert the quote inside the same transaction.
+  const insertSql = `
+    INSERT INTO payment_quotes (
+      id, quote_nonce, query_text, matched_chunk_ids, publisher_breakdown,
+      total_price_usdc, memo_expected, buyer_wallet, expires_at, status
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING')
+    RETURNING *;
+  `;
+
+  const res = await client.query(insertSql, [
+    quoteId,
+    quoteNonce,
+    queryText,
+    JSON.stringify(uniqueRequestedIds),
+    JSON.stringify(
+      publisherBreakdown.map((p) => ({
+        ...p,
+        amount_base_units: p.amount_base_units.toString(),
+        documents: p.documents.map((d) => ({
+          ...d,
+          amount_base_units: d.amount_base_units.toString(),
+        })),
+      }))
+    ),
+    formatUsdc(totalBaseUnits),
+    memoExpected,
+    buyerWallet,
+    expiresAt,
+  ]);
+
+  // 5. Insert immutable source snapshots inside the same transaction.
+  //    Content, hash, and price all come from the canonical DB record.
+  const sourceInsertSql = `
+    INSERT INTO payment_quote_sources (
+      id, quote_id, ordinal, chunk_id, document_id, publisher_id,
+      publisher_wallet, document_title, source_content, source_sha256,
+      document_price_base_units
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+  `;
+
+  let ordinal = 0;
+  for (const chunk of orderedAuthoritative) {
+    // Recalculate SHA-256 from current DB content and reject if it doesn't
+    // match the stored content_hash.
+    const recalculatedHash = computeSha256(chunk.content);
+    if (recalculatedHash !== chunk.content_hash) {
+      throw new Error(
+        `Source integrity check failed for chunk ${chunk.id}: content hash mismatch. Stored hash ${chunk.content_hash} does not match recomputed hash ${recalculatedHash}.`
+      );
+    }
+
+    await client.query(sourceInsertSql, [
+      `src_${crypto.randomUUID()}`,
+      quoteId,
+      ordinal++,
+      chunk.id,
+      chunk.document_id,
+      chunk.publisher_id,
+      chunk.publisher_wallet,
+      chunk.document_title,
+      chunk.content,
+      recalculatedHash,
+      BigInt(parseNumericPrice(chunk.price_per_query_usdc)),
+    ]);
+  }
 
   return {
-    id: quoteRow.id,
-    quote_nonce: quoteRow.quote_nonce,
-    query_text: quoteRow.query_text,
-    matched_chunk_ids: quoteRow.matched_chunk_ids,
-    publisher_breakdown: publisherBreakdown,
-    total_price_usdc: totalPriceUsdc,
-    total_base_units: totalBaseUnits,
-    memo_expected: quoteRow.memo_expected,
-    buyer_wallet: quoteRow.buyer_wallet,
-    expires_at: quoteRow.expires_at,
-    status: quoteRow.status,
-    created_at: quoteRow.created_at,
+    quoteRow: res.rows[0],
+    publisherBreakdown,
+    totalBaseUnits,
+    totalPriceUsdc,
+  };
+}
+
+export async function createPaymentQuote(
+  queryText: string,
+  matchedChunks: ChunkRecord[],
+  buyerWallet: string | null = null,
+  expirySeconds: number = config.quoteExpirySeconds
+): Promise<PaymentQuote> {
+  if (matchedChunks.length === 0) {
+    throw new Error('Cannot create quote with zero matched chunks.');
+  }
+
+  // matchedChunks is used only to identify the requested chunk IDs and to
+  // preserve their intended ordering. All authoritative data (price, wallet,
+  // publisher identity, document title, content, hashes) is loaded from the
+  // database inside the transaction below. Caller-supplied metadata is never
+  // trusted as a source of truth for pricing or allocation.
+
+  const result = await withTransaction(async (client) => {
+    return runQuoteTransaction(
+      client,
+      queryText,
+      matchedChunks,
+      buyerWallet,
+      expirySeconds
+    );
+  });
+
+  return {
+    id: result.quoteRow.id,
+    quote_nonce: result.quoteRow.quote_nonce,
+    query_text: result.quoteRow.query_text,
+    matched_chunk_ids: result.quoteRow.matched_chunk_ids,
+    publisher_breakdown: result.publisherBreakdown,
+    total_price_usdc: result.totalPriceUsdc,
+    total_base_units: result.totalBaseUnits,
+    memo_expected: result.quoteRow.memo_expected,
+    buyer_wallet: result.quoteRow.buyer_wallet,
+    expires_at: result.quoteRow.expires_at,
+    status: result.quoteRow.status,
+    created_at: result.quoteRow.created_at,
   };
 }
 

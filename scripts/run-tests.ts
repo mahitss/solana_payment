@@ -19,7 +19,7 @@ import {
   formatUsdc,
   parseNumericPrice,
 } from '../lib/protocol';
-import { createPaymentQuote, getQuote, getQuoteSources, validateQuoteSnapshotSet, loadEligibleChunksForQuote } from '../lib/quotes';
+import { createPaymentQuote, getQuote, getQuoteSources, validateQuoteSnapshotSet, loadEligibleChunksForQuote, runQuoteTransaction } from '../lib/quotes';
 import {
   verifySettlementTransaction,
   SolanaVerificationError,
@@ -42,10 +42,12 @@ import { isSupportedLicenseType, getSupportedLicenseTypes } from '../lib/eligibi
 import { IneligibleSourceError, assertChunksEligible } from '../lib/eligibility';
 import { ingestDocument, getDocumentById, ChunkRecord } from '../lib/documents';
 import { categorizeChunkEmbedding, collectChunksForBackfill, persistBackfillBatch, renderDryRunSummary, ChunkToEmbed } from './embed-backfill';
-import { validateEvaluationDataset, renderNotEvaluated, EvalQuery } from './evaluate-retrieval';
+import { validateEvaluationDataset, renderNotEvaluated, EvalQuery, areEvaluationMethodsComparable } from './evaluate-retrieval';
 import { buildGroundedPrompt, extractCitations } from '../lib/ai/provider';
 import { searchKnowledgeCollections, searchWithDiagnostics, setQueryOverride, resetQueryOverride } from '../lib/retrieval';
+import { PoolClient } from 'pg';
 import { query, pool } from '../lib/db';
+import { config } from '../lib/config';
 
 /**
  * CiteRail test suite.
@@ -57,7 +59,8 @@ import { query, pool } from '../lib/db';
  */
 
 const RUN_NETWORK_TESTS = process.env.RUN_NETWORK_TESTS === '1';
-const HAS_DB = Boolean(process.env.DATABASE_URL);
+const isLocalDb = process.env.DATABASE_URL?.includes('localhost') || process.env.DATABASE_URL?.includes('127.0.0.1');
+const HAS_DB = Boolean(process.env.DATABASE_URL) && isLocalDb;
 
 let passed = 0;
 let failed = 0;
@@ -5938,8 +5941,8 @@ if (HAS_DB) {
   }
 
   await test('Concurrent revocation: revocation obtains lock first (Scenario A)', async () => {
-    if (!HAS_DB) {
-      assert(true, 'Skipped: no DATABASE_URL');
+    if (!HAS_DB || !isLocalDb) {
+      assert(true, 'Skipped: no local DATABASE_URL');
       return;
     }
     const wallet = makeWallet().address;
@@ -6012,8 +6015,8 @@ if (HAS_DB) {
   });
 
   await test('Concurrent revocation: quote obtains lock first (Scenario B)', async () => {
-    if (!HAS_DB) {
-      assert(true, 'Skipped: no DATABASE_URL');
+    if (!HAS_DB || !isLocalDb) {
+      assert(true, 'Skipped: no local DATABASE_URL');
       return;
     }
     const wallet = makeWallet().address;
@@ -6124,8 +6127,8 @@ if (HAS_DB) {
   }
 
   await test('Concurrent price: price update obtains lock first (Scenario A)', async () => {
-    if (!HAS_DB) {
-      assert(true, 'Skipped: no DATABASE_URL');
+    if (!HAS_DB || !isLocalDb) {
+      assert(true, 'Skipped: no local DATABASE_URL');
       return;
     }
     const wallet = makeWallet().address;
@@ -6200,8 +6203,8 @@ if (HAS_DB) {
   });
 
   await test('Concurrent price: quote obtains lock first (Scenario B)', async () => {
-    if (!HAS_DB) {
-      assert(true, 'Skipped: no DATABASE_URL');
+    if (!HAS_DB || !isLocalDb) {
+      assert(true, 'Skipped: no local DATABASE_URL');
       return;
     }
     const wallet = makeWallet().address;
@@ -6287,8 +6290,8 @@ if (HAS_DB) {
   // ------------------------------------------------------------------
 
   await test('Stale retrieval price revalidation: DB price wins over stale retrieved price', async () => {
-    if (!HAS_DB) {
-      assert(true, 'Skipped: no DATABASE_URL');
+    if (!HAS_DB || !isLocalDb) {
+      assert(true, 'Skipped: no local DATABASE_URL');
       return;
     }
     const wallet = makeWallet().address;
@@ -6384,6 +6387,1053 @@ if (HAS_DB) {
   });
 
   // ------------------------------------------------------------------
+  // Mission 003.2.4: Evaluation comparison completeness tests
+  // ------------------------------------------------------------------
+
+  await test('Evaluation comparison: complete FTS, semantic, and hybrid allows comparison', () => {
+    const fts = {
+      method: 'FTS-only',
+      totalQueries: 5,
+      recallAt5: 0.8,
+      recallAt10: 0.9,
+      mrrAt10: 0.85,
+      ndcgAt10: 0.82,
+      emptyResults: 0,
+      avgLatencyMs: 10,
+      perQuery: [],
+      diagnostics: {
+        label: 'FTS-only',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: true,
+        semanticOnly: false,
+        pathsUsed: ['fts'],
+      },
+    };
+    const semantic = {
+      method: 'Semantic-only',
+      totalQueries: 5,
+      recallAt5: 0.9,
+      recallAt10: 0.95,
+      mrrAt10: 0.92,
+      ndcgAt10: 0.9,
+      emptyResults: 0,
+      avgLatencyMs: 50,
+      perQuery: [],
+      diagnostics: {
+        label: 'Semantic-only',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: false,
+        semanticOnly: true,
+        pathsUsed: ['semantic'],
+      },
+    };
+    const hybrid = {
+      method: 'Hybrid (FTS + semantic)',
+      totalQueries: 5,
+      recallAt5: 0.95,
+      recallAt10: 0.98,
+      mrrAt10: 0.94,
+      ndcgAt10: 0.93,
+      emptyResults: 0,
+      avgLatencyMs: 60,
+      perQuery: [],
+      diagnostics: {
+        label: 'Hybrid (FTS + semantic)',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: false,
+        semanticOnly: false,
+        pathsUsed: ['fts', 'semantic'],
+      },
+    };
+    assert(areEvaluationMethodsComparable(fts, semantic, hybrid), 'Comparison should be allowed when all methods complete');
+  });
+
+  await test('Evaluation comparison: incomplete FTS baseline prohibits comparison', () => {
+    const fts = {
+      method: 'FTS-only',
+      totalQueries: 5,
+      recallAt5: 0,
+      recallAt10: 0,
+      mrrAt10: 0,
+      ndcgAt10: 0,
+      emptyResults: 5,
+      avgLatencyMs: 0,
+      perQuery: [],
+      diagnostics: {
+        label: 'FTS-only — INCOMPLETE',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 3,
+        queryFailures: 0,
+        complete: false,
+        modelDigest: null,
+        ftsOnly: true,
+        semanticOnly: false,
+        pathsUsed: [],
+      },
+    };
+    const semantic = {
+      method: 'Semantic-only',
+      totalQueries: 5,
+      recallAt5: 0.9,
+      recallAt10: 0.95,
+      mrrAt10: 0.92,
+      ndcgAt10: 0.9,
+      emptyResults: 0,
+      avgLatencyMs: 50,
+      perQuery: [],
+      diagnostics: {
+        label: 'Semantic-only',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: false,
+        semanticOnly: true,
+        pathsUsed: ['semantic'],
+      },
+    };
+    const hybrid = {
+      method: 'Hybrid (FTS + semantic)',
+      totalQueries: 5,
+      recallAt5: 0.95,
+      recallAt10: 0.98,
+      mrrAt10: 0.94,
+      ndcgAt10: 0.93,
+      emptyResults: 0,
+      avgLatencyMs: 60,
+      perQuery: [],
+      diagnostics: {
+        label: 'Hybrid (FTS + semantic)',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: false,
+        semanticOnly: false,
+        pathsUsed: ['fts', 'semantic'],
+      },
+    };
+    assert(!areEvaluationMethodsComparable(fts, semantic, hybrid), 'Comparison should be prohibited when FTS baseline incomplete');
+  });
+
+  await test('Evaluation comparison: incomplete semantic-only prohibits comparison', () => {
+    const fts = {
+      method: 'FTS-only',
+      totalQueries: 5,
+      recallAt5: 0.8,
+      recallAt10: 0.9,
+      mrrAt10: 0.85,
+      ndcgAt10: 0.82,
+      emptyResults: 0,
+      avgLatencyMs: 10,
+      perQuery: [],
+      diagnostics: {
+        label: 'FTS-only',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: true,
+        semanticOnly: false,
+        pathsUsed: ['fts'],
+      },
+    };
+    const semantic = {
+      method: 'Semantic-only',
+      totalQueries: 5,
+      recallAt5: 0,
+      recallAt10: 0,
+      mrrAt10: 0,
+      ndcgAt10: 0,
+      emptyResults: 5,
+      avgLatencyMs: 0,
+      perQuery: [],
+      diagnostics: {
+        label: 'Semantic-only — INCOMPLETE',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 3,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: false,
+        modelDigest: null,
+        ftsOnly: false,
+        semanticOnly: true,
+        pathsUsed: [],
+      },
+    };
+    const hybrid = {
+      method: 'Hybrid (FTS + semantic)',
+      totalQueries: 5,
+      recallAt5: 0.95,
+      recallAt10: 0.98,
+      mrrAt10: 0.94,
+      ndcgAt10: 0.93,
+      emptyResults: 0,
+      avgLatencyMs: 60,
+      perQuery: [],
+      diagnostics: {
+        label: 'Hybrid (FTS + semantic)',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: false,
+        semanticOnly: false,
+        pathsUsed: ['fts', 'semantic'],
+      },
+    };
+    assert(!areEvaluationMethodsComparable(fts, semantic, hybrid), 'Comparison should be prohibited when semantic incomplete');
+  });
+
+  await test('Evaluation comparison: incomplete hybrid prohibits comparison', () => {
+    const fts = {
+      method: 'FTS-only',
+      totalQueries: 5,
+      recallAt5: 0.8,
+      recallAt10: 0.9,
+      mrrAt10: 0.85,
+      ndcgAt10: 0.82,
+      emptyResults: 0,
+      avgLatencyMs: 10,
+      perQuery: [],
+      diagnostics: {
+        label: 'FTS-only',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: true,
+        semanticOnly: false,
+        pathsUsed: ['fts'],
+      },
+    };
+    const semantic = {
+      method: 'Semantic-only',
+      totalQueries: 5,
+      recallAt5: 0.9,
+      recallAt10: 0.95,
+      mrrAt10: 0.92,
+      ndcgAt10: 0.9,
+      emptyResults: 0,
+      avgLatencyMs: 50,
+      perQuery: [],
+      diagnostics: {
+        label: 'Semantic-only',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: false,
+        semanticOnly: true,
+        pathsUsed: ['semantic'],
+      },
+    };
+    const hybrid = {
+      method: 'Hybrid (FTS + semantic)',
+      totalQueries: 5,
+      recallAt5: 0,
+      recallAt10: 0,
+      mrrAt10: 0,
+      ndcgAt10: 0,
+      emptyResults: 5,
+      avgLatencyMs: 0,
+      perQuery: [],
+      diagnostics: {
+        label: 'Hybrid — INCOMPLETE',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 3,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: false,
+        modelDigest: null,
+        ftsOnly: false,
+        semanticOnly: false,
+        pathsUsed: ['fts'],
+      },
+    };
+    assert(!areEvaluationMethodsComparable(fts, semantic, hybrid), 'Comparison should be prohibited when hybrid incomplete');
+  });
+
+  await test('Evaluation comparison: hybrid missing semantic path prohibits comparison', () => {
+    const fts = {
+      method: 'FTS-only',
+      totalQueries: 5,
+      recallAt5: 0.8,
+      recallAt10: 0.9,
+      mrrAt10: 0.85,
+      ndcgAt10: 0.82,
+      emptyResults: 0,
+      avgLatencyMs: 10,
+      perQuery: [],
+      diagnostics: {
+        label: 'FTS-only',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: true,
+        semanticOnly: false,
+        pathsUsed: ['fts'],
+      },
+    };
+    const semantic = {
+      method: 'Semantic-only',
+      totalQueries: 5,
+      recallAt5: 0.9,
+      recallAt10: 0.95,
+      mrrAt10: 0.92,
+      ndcgAt10: 0.9,
+      emptyResults: 0,
+      avgLatencyMs: 50,
+      perQuery: [],
+      diagnostics: {
+        label: 'Semantic-only',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: false,
+        semanticOnly: true,
+        pathsUsed: ['semantic'],
+      },
+    };
+    const hybrid = {
+      method: 'Hybrid (FTS + semantic)',
+      totalQueries: 5,
+      recallAt5: 0.85,
+      recallAt10: 0.92,
+      mrrAt10: 0.88,
+      ndcgAt10: 0.86,
+      emptyResults: 0,
+      avgLatencyMs: 20,
+      perQuery: [],
+      diagnostics: {
+        label: 'Hybrid — INCOMPLETE',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: 'sha256:aa'.repeat(32),
+        ftsOnly: false,
+        semanticOnly: false,
+        pathsUsed: ['fts'],
+      },
+    };
+    assert(!areEvaluationMethodsComparable(fts, semantic, hybrid), 'Comparison should be prohibited when hybrid missing semantic path');
+  });
+
+  await test('Evaluation comparison: missing semantic provider is NOT EVALUATED', () => {
+    const fts = {
+      method: 'FTS-only',
+      totalQueries: 5,
+      recallAt5: 0.8,
+      recallAt10: 0.9,
+      mrrAt10: 0.85,
+      ndcgAt10: 0.82,
+      emptyResults: 0,
+      avgLatencyMs: 10,
+      perQuery: [],
+      diagnostics: {
+        label: 'FTS-only',
+        semanticAvailable: false,
+        semanticSkipped: true,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: true,
+        modelDigest: null,
+        ftsOnly: true,
+        semanticOnly: false,
+        pathsUsed: ['fts'],
+      },
+    };
+    const hybrid = {
+      method: 'Hybrid (FTS + semantic)',
+      totalQueries: 5,
+      recallAt5: 0,
+      recallAt10: 0,
+      mrrAt10: 0,
+      ndcgAt10: 0,
+      emptyResults: 5,
+      avgLatencyMs: 0,
+      perQuery: [],
+      diagnostics: {
+        label: 'NOT EVALUATED',
+        semanticAvailable: false,
+        semanticSkipped: true,
+        semanticFailures: 5,
+        ftsFailures: 0,
+        queryFailures: 0,
+        complete: false,
+        modelDigest: null,
+        ftsOnly: false,
+        semanticOnly: false,
+        pathsUsed: [],
+      },
+    };
+    assert(!areEvaluationMethodsComparable(fts, null, hybrid), 'Comparison should be prohibited when no semantic provider');
+  });
+
+  await test('Evaluation comparison: query failure makes method incomplete', () => {
+    const fts = {
+      method: 'FTS-only',
+      totalQueries: 5,
+      recallAt5: 0.8,
+      recallAt10: 0.9,
+      mrrAt10: 0.85,
+      ndcgAt10: 0.82,
+      emptyResults: 1,
+      avgLatencyMs: 10,
+      perQuery: [],
+      diagnostics: {
+        label: 'FTS-only — INCOMPLETE',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 1,
+        complete: false,
+        modelDigest: null,
+        ftsOnly: true,
+        semanticOnly: false,
+        pathsUsed: ['fts'],
+      },
+    };
+    const semantic = {
+      method: 'Semantic-only',
+      totalQueries: 5,
+      recallAt5: 0.9,
+      recallAt10: 0.95,
+      mrrAt10: 0.92,
+      ndcgAt10: 0.9,
+      emptyResults: 0,
+      avgLatencyMs: 50,
+      perQuery: [],
+      diagnostics: {
+        label: 'Semantic-only — INCOMPLETE',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 1,
+        complete: false,
+        modelDigest: null,
+        ftsOnly: false,
+        semanticOnly: true,
+        pathsUsed: ['semantic'],
+      },
+    };
+    const hybrid = {
+      method: 'Hybrid (FTS + semantic)',
+      totalQueries: 5,
+      recallAt5: 0.95,
+      recallAt10: 0.98,
+      mrrAt10: 0.94,
+      ndcgAt10: 0.93,
+      emptyResults: 0,
+      avgLatencyMs: 60,
+      perQuery: [],
+      diagnostics: {
+        label: 'Hybrid — INCOMPLETE',
+        semanticAvailable: true,
+        semanticSkipped: false,
+        semanticFailures: 0,
+        ftsFailures: 0,
+        queryFailures: 1,
+        complete: false,
+        modelDigest: null,
+        ftsOnly: false,
+        semanticOnly: false,
+        pathsUsed: ['fts', 'semantic'],
+      },
+    };
+    assert(!areEvaluationMethodsComparable(fts, semantic, hybrid), 'Comparison should be prohibited when a query fails');
+  });
+
+  // ------------------------------------------------------------------
+  // Mission 003.2.4: Real PostgreSQL concurrency tests
+  // ------------------------------------------------------------------
+
+  async function createConcurrencyFixture(wallet: string, price: string = '0.050000') {
+    const publisherId = uniqueId('pub_conc');
+    const docId = uniqueId('doc_conc');
+    const chunkId = uniqueId('chk_conc');
+    const content = 'Concurrency test content ' + uniqueId('content');
+    await query(
+      'INSERT INTO publishers (id, wallet_address, name, status, verified_at) VALUES ($1, $2, $3, $4, NOW())',
+      [publisherId, wallet, 'Concurrency Pub', 'active']
+    );
+    await query(
+      'INSERT INTO documents (id, publisher_id, title, file_type, content_hash, license_type, price_per_query_usdc, total_chunks, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)',
+      [docId, publisherId, 'Concurrency Doc', 'md', computeSha256(content), 'query_royalty_v1', price, 'active']
+    );
+    await query(
+      'INSERT INTO document_chunks (id, document_id, publisher_id, chunk_index, content, content_hash, token_count, search_vector) VALUES ($1, $2, $3, 0, $4, $5, 10, to_tsvector($6, $4))',
+      [chunkId, docId, publisherId, content, computeSha256(content), 'english']
+    );
+    await query('UPDATE publishers SET verified_at = NOW() WHERE wallet_address = $1', [wallet]);
+    return { docId, chunkId, publisherId, content, price };
+  }
+
+  async function removeConcurrencyFixture(docId: string, wallet: string) {
+    await query('DELETE FROM documents WHERE id = $1', [docId]);
+    await query('DELETE FROM publishers WHERE wallet_address = $1', [wallet]);
+  }
+
+  function getConcurrencyChunkRecord(docId: string, chunkId: string, publisherId: string, wallet: string, content: string, price: string): ChunkRecord {
+    return {
+      id: chunkId,
+      document_id: docId,
+      publisher_id: publisherId,
+      publisher_wallet: wallet,
+      publisher_name: 'Concurrency Pub',
+      document_title: 'Concurrency Doc',
+      price_per_query_usdc: price,
+      chunk_index: 0,
+      content,
+      content_hash: computeSha256(content),
+      token_count: 10,
+    };
+  }
+
+  async function getBackendPid(client: PoolClient): Promise<number> {
+    const res = await client.query<{ pg_backend_pid: number }>('SELECT pg_backend_pid()');
+    return res.rows[0].pg_backend_pid;
+  }
+
+  async function getBlockingPids(client: PoolClient, pid: number): Promise<number[]> {
+    const res = await client.query<{ pid: number }>(
+      'SELECT unnest(pg_blocking_pids($1)) AS pid',
+      [pid]
+    );
+    return res.rows.map((r) => r.pid);
+  }
+
+  async function waitForCondition(condition: () => boolean | Promise<boolean>, maxMs: number = 5000, intervalMs: number = 50): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < maxMs) {
+      if (await condition()) return true;
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    return false;
+  }
+
+  async function tryGetClient(timeoutMs: number = 3000): Promise<PoolClient | null> {
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('connect timeout')), timeoutMs)
+    );
+    let client: PoolClient | null = null;
+    try {
+      client = await Promise.race([pool.connect(), timeout]);
+      // Quick test query with its own timeout
+      await Promise.race([client.query('SELECT 1'), timeout]);
+      return client;
+    } catch {
+      try { await client?.end(); } catch {}
+      return null;
+    }
+  }
+
+  await test('Concurrency: revocation obtains lock first (Scenario A)', async () => {
+    if (!HAS_DB || !isLocalDb) {
+      assert(true, 'Skipped: no local DATABASE_URL');
+      return;
+    }
+    const wallet = makeWallet().address;
+    const { docId, chunkId, publisherId, content } = await createConcurrencyFixture(wallet);
+    const chunkRecord = getConcurrencyChunkRecord(docId, chunkId, publisherId, wallet, content, '0.050000');
+
+    let quoteError: Error | undefined;
+    let quoteClientPid: number | undefined;
+    let blockingPids: number[] = [];
+
+    const clientA = await tryGetClient();
+    const clientC = await tryGetClient(); // observer connection
+    let clientB: PoolClient | null = null;
+    if (!clientA || !clientC) {
+      assert(true, 'Skipped: no database connection available');
+      return;
+    }
+    try {
+      // Connection A: revoke document and hold the lock
+      await clientA.query('BEGIN');
+      await clientA.query('UPDATE documents SET status = $1 WHERE id = $2', ['revoked', docId]);
+      const pidA = await getBackendPid(clientA);
+
+      // Connection B: start quote creation (will block on FOR SHARE lock)
+      clientB = await tryGetClient();
+      if (!clientB) {
+        assert(true, 'Skipped: no database connection for client B');
+        return;
+      }
+      quoteClientPid = await getBackendPid(clientB);
+      await clientB.query('BEGIN');
+
+      const bPromise = runQuoteTransaction(
+        clientB,
+        'Concurrency revocation quote A',
+        [chunkRecord],
+        null,
+        config.quoteExpirySeconds
+      ).then(
+        () => { /* success */ },
+        (err) => { quoteError = err as Error; }
+      );
+
+      // Wait for B to be blocked by A's lock (observed via pg_blocking_pids)
+      const blocked = await waitForCondition(async () => {
+        const blocking = await getBlockingPids(clientC, quoteClientPid!);
+        return blocking.length > 0;
+      }, 5000);
+
+      blockingPids = await getBlockingPids(clientC, quoteClientPid!);
+
+      assert(blocked, 'Quote connection should be blocked by revocation lock');
+      assert(
+        blockingPids.includes(pidA),
+        `Blocking PID should include the revocation connection (${pidA}), got: ${JSON.stringify(blockingPids)}`
+      );
+
+      // Connection A: commit the revocation
+      await clientA.query('COMMIT');
+
+      // Wait for B to complete (it should throw IneligibleSourceError)
+      await bPromise;
+
+      // B should reject with IneligibleSourceError
+      assert(quoteError, 'Quote should have thrown an error');
+      assert.strictEqual(
+        (quoteError as any).code,
+        'INELIGIBLE_SOURCE_CHUNK',
+        `Expected INELIGIBLE_SOURCE_CHUNK, got: ${(quoteError as any).code}`
+      );
+
+      // Verify no quote or source snapshots were persisted
+      const quoteCount = await query<{ cnt: number }>(
+        'SELECT COUNT(*)::int AS cnt FROM payment_quotes WHERE matched_chunk_ids::text LIKE $1',
+        [`%${chunkId}%`]
+      );
+      assert.strictEqual(
+        quoteCount.rows[0].cnt,
+        0,
+        'No quote should exist for revoked chunk'
+      );
+
+      const snapshotCount = await query<{ cnt: number }>(
+        'SELECT COUNT(*)::int AS cnt FROM payment_quote_sources WHERE chunk_id = $1',
+        [chunkId]
+      );
+      assert.strictEqual(
+        snapshotCount.rows[0].cnt,
+        0,
+        'No source snapshots should exist for revoked chunk'
+      );
+    } finally {
+      try { await clientA.query('ROLLBACK'); } catch {}
+      clientA.release();
+      if (clientB) {
+        try { await clientB.query('ROLLBACK'); } catch {}
+        clientB.release();
+      }
+      try { await clientC.query('ROLLBACK'); } catch {}
+      clientC.release();
+      await removeConcurrencyFixture(docId, wallet);
+    }
+  });
+
+  await test('Concurrency: quote obtains lock first (Scenario B)', async () => {
+    if (!HAS_DB || !isLocalDb) {
+      assert(true, 'Skipped: no local DATABASE_URL');
+      return;
+    }
+    const wallet = makeWallet().address;
+    const { docId, chunkId, publisherId, content } = await createConcurrencyFixture(wallet);
+    const chunkRecord = getConcurrencyChunkRecord(docId, chunkId, publisherId, wallet, content, '0.050000');
+
+    let quoteCreated = false;
+    let quoteRow: any = undefined;
+    let revocationCommitted = false;
+    let revocationError: Error | undefined;
+    let releaseQuote: (() => void) | undefined;
+    let locksAcquired = false;
+
+    const clientA = await pool.connect();
+    const clientC = await pool.connect(); // observer
+    let clientB: PoolClient | null = null;
+    try {
+      // Connection A: start quote transaction, pause after FOR SHARE locks
+      await clientA.query('BEGIN');
+      const pidA = await getBackendPid(clientA);
+      const observerPid = await getBackendPid(clientC);
+
+      const quotePromise = runQuoteTransaction(
+        clientA,
+        'Concurrency revocation quote B',
+        [chunkRecord],
+        null,
+        config.quoteExpirySeconds,
+        (release) => {
+          releaseQuote = release;
+          locksAcquired = true;
+        }
+      ).then(
+        (result) => { quoteRow = result; quoteCreated = true; },
+        (err) => { console.error('Quote error:', err); }
+      );
+
+      // Wait for the quote transaction to acquire locks and pause
+      await waitForCondition(() => locksAcquired === true, 5000);
+      assert(locksAcquired, 'Quote transaction should have acquired locks and paused');
+
+      // Connection B: attempt revocation (should block on A's FOR SHARE lock)
+      clientB = await pool.connect();
+      await clientB.query('BEGIN');
+
+      const revokePromise = (async () => {
+        try {
+          await clientB.query('UPDATE documents SET status = $1 WHERE id = $2', ['revoked', docId]);
+          await clientB.query('COMMIT');
+          revocationCommitted = true;
+        } catch (err) {
+          revocationError = err as Error;
+        } finally {
+          try { await clientB.query('ROLLBACK'); } catch {}
+          clientB.release();
+        }
+      })();
+
+      // Wait for B to block
+      const blocked = await waitForCondition(async () => {
+        assert(clientB, 'clientB should be defined');
+        const blocking = await getBlockingPids(clientC, (await getBackendPid(clientB!)));
+        return blocking.includes(pidA);
+      }, 5000);
+
+      assert(
+        blocked,
+        `Revocation connection should be blocked by quote transaction PID ${pidA}`
+      );
+
+      // Connection A: release pause and commit
+      assert(releaseQuote, 'Release function should be available');
+      releaseQuote!();
+      await quotePromise;
+      assert(quoteCreated, 'Quote should have been created');
+      await clientA.query('COMMIT');
+
+      // Wait for B's revocation to complete
+      await revokePromise;
+      assert(revocationCommitted, 'Revocation should complete after quote commit');
+
+      // Verify quote contains correct canonical source snapshots
+      assert(quoteRow, 'Quote row should exist');
+      const snapshots = await getQuoteSources(quoteRow.id);
+      assert.strictEqual(snapshots.length, 1, 'Quote should have 1 snapshot');
+      assert.strictEqual(snapshots[0].chunk_id, chunkId, 'Snapshot should reference the chunk');
+      assert.strictEqual(snapshots[0].source_content, content, 'Snapshot should have canonical content');
+
+      // Verify document is now revoked
+      const docStatus = await query<{ status: string }>(
+        'SELECT status FROM documents WHERE id = $1',
+        [docId]
+      );
+      assert.strictEqual(docStatus.rows[0].status, 'revoked', 'Document should be revoked after quote commit');
+
+    } finally {
+      try { await clientA.query('ROLLBACK'); } catch {}
+      clientA.release();
+      if (clientB) {
+        try { await clientB.query('ROLLBACK'); } catch {}
+        clientB.release();
+      }
+      try { await clientC.query('ROLLBACK'); } catch {}
+      clientC.release();
+      await removeConcurrencyFixture(docId, wallet);
+    }
+  });
+
+  await test('Concurrency: price update obtains lock first (Scenario A)', async () => {
+    if (!HAS_DB || !isLocalDb) {
+      assert(true, 'Skipped: no local DATABASE_URL');
+      return;
+    }
+    const wallet = makeWallet().address;
+    const { docId, chunkId, publisherId, content } = await createConcurrencyFixture(wallet, '0.050000');
+    const chunkRecord = getConcurrencyChunkRecord(docId, chunkId, publisherId, wallet, content, '0.050000');
+
+    let quoteError: Error | undefined;
+    let quoteClientPid: number | undefined;
+    let blockingPids: number[] = [];
+
+    const clientA = await pool.connect();
+    const clientC = await pool.connect(); // observer
+    let clientB: PoolClient | null = null;
+    try {
+      // Connection A: update price and hold the lock
+      await clientA.query('BEGIN');
+      await clientA.query('UPDATE documents SET price_per_query_usdc = $1 WHERE id = $2', ['0.100000', docId]);
+      const pidA = await getBackendPid(clientA);
+
+      // Connection B: start quote creation (will block on FOR SHARE lock)
+      clientB = await tryGetClient();
+      if (!clientB) {
+        assert(true, 'Skipped: no database connection for client B');
+        return;
+      }
+      quoteClientPid = await getBackendPid(clientB);
+      await clientB.query('BEGIN');
+
+      const bPromise = runQuoteTransaction(
+        clientB,
+        'Concurrency price quote A',
+        [chunkRecord],
+        null,
+        config.quoteExpirySeconds
+      ).then(
+        () => { /* success */ },
+        (err) => { quoteError = err as Error; }
+      );
+
+      // Wait for B to be blocked by A's lock
+      const blocked = await waitForCondition(async () => {
+        const blocking = await getBlockingPids(clientC, quoteClientPid!);
+        return blocking.length > 0;
+      }, 5000);
+
+      blockingPids = await getBlockingPids(clientC, quoteClientPid!);
+
+      assert(blocked, 'Quote connection should be blocked by price update lock');
+      assert(
+        blockingPids.includes(pidA),
+        `Blocking PID should include the price update connection (${pidA}), got: ${JSON.stringify(blockingPids)}`
+      );
+
+      // Connection A: commit the price update
+      await clientA.query('COMMIT');
+
+      // Wait for B to complete
+      await bPromise;
+
+      // B should succeed with the new price (0.10)
+      assert(!quoteError, `Quote should not have thrown, got: ${quoteError?.message}`);
+
+      // Verify quote uses new database price (0.10 = 100,000 base units)
+      const quoteCount = await query<{ cnt: number }>(
+        'SELECT COUNT(*)::int AS cnt FROM payment_quotes WHERE matched_chunk_ids::text LIKE $1',
+        [`%${chunkId}%`]
+      );
+      assert.strictEqual(quoteCount.rows[0].cnt, 1, 'Quote should exist after price update commit');
+
+      const latestQuote = await query<{ publisher_breakdown: any }>(
+        'SELECT publisher_breakdown FROM payment_quotes WHERE matched_chunk_ids::text LIKE $1 ORDER BY created_at DESC LIMIT 1',
+        [`%${chunkId}%`]
+      );
+      const breakdown = latestQuote.rows[0].publisher_breakdown;
+      const totalUnits = breakdown.reduce(
+        (sum: number, p: any) => sum + Number(p.amount_base_units),
+        0
+      );
+      assert.strictEqual(
+        totalUnits,
+        100_000,
+        `Quote should use new price 0.10 USDC = 100,000 base units, got ${totalUnits}`
+      );
+
+      // Verify snapshot price matches
+      const snapshots = await query<{ document_price_base_units: string }>(
+        'SELECT document_price_base_units FROM payment_quote_sources WHERE chunk_id = $1 ORDER BY ordinal LIMIT 1',
+        [chunkId]
+      );
+      assert.strictEqual(
+        snapshots.rows[0].document_price_base_units,
+        '100000',
+        'Snapshot price should be 0.10 USDC'
+      );
+
+    } finally {
+      try { await clientA.query('ROLLBACK'); } catch {}
+      clientA.release();
+      if (clientB) {
+        try { await clientB.query('ROLLBACK'); } catch {}
+        clientB.release();
+      }
+      try { await clientC.query('ROLLBACK'); } catch {}
+      clientC.release();
+      await removeConcurrencyFixture(docId, wallet);
+    }
+  });
+
+  await test('Concurrency: quote obtains price lock first (Scenario B)', async () => {
+    if (!HAS_DB || !isLocalDb) {
+      assert(true, 'Skipped: no local DATABASE_URL');
+      return;
+    }
+    const wallet = makeWallet().address;
+    const { docId, chunkId, publisherId, content } = await createConcurrencyFixture(wallet, '0.050000');
+    const chunkRecord = getConcurrencyChunkRecord(docId, chunkId, publisherId, wallet, content, '0.050000');
+
+    let quoteCreated = false;
+    let quoteRow: any = undefined;
+    let priceUpdated = false;
+    let releaseQuote: (() => void) | undefined;
+    let locksAcquired = false;
+
+    const clientA = await pool.connect();
+    const clientC = await pool.connect(); // observer
+    let clientB: PoolClient | null = null;
+    try {
+      // Connection A: start quote transaction, pause after FOR SHARE locks
+      await clientA.query('BEGIN');
+      const pidA = await getBackendPid(clientA);
+
+      const quotePromise = runQuoteTransaction(
+        clientA,
+        'Concurrency price quote B',
+        [chunkRecord],
+        null,
+        config.quoteExpirySeconds,
+        (release) => {
+          releaseQuote = release;
+          locksAcquired = true;
+        }
+      ).then(
+        (result) => { quoteRow = result; quoteCreated = true; },
+        (err) => { console.error('Quote error:', err); }
+      );
+
+      // Wait for the quote transaction to acquire locks and pause
+      await waitForCondition(() => locksAcquired === true, 5000);
+      assert(locksAcquired, 'Quote transaction should have acquired locks and paused');
+
+      // Connection B: attempt price update (should block on A's FOR SHARE lock)
+      clientB = await pool.connect();
+      await clientB.query('BEGIN');
+
+      const pricePromise = (async () => {
+        try {
+          await clientB.query('UPDATE documents SET price_per_query_usdc = $1 WHERE id = $2', ['0.100000', docId]);
+          await clientB.query('COMMIT');
+          priceUpdated = true;
+        } catch (err) {
+          // Expected: blocked until quote commits
+        } finally {
+          try { await clientB.query('ROLLBACK'); } catch {}
+          clientB.release();
+        }
+      })();
+
+      // Wait for B to block
+      const blocked = await waitForCondition(async () => {
+        assert(clientB, 'clientB should be defined');
+        const blocking = await getBlockingPids(clientC, (await getBackendPid(clientB!)));
+        return blocking.includes(pidA);
+      }, 5000);
+
+      assert(
+        blocked,
+        `Price update connection should be blocked by quote transaction PID ${pidA}`
+      );
+
+      // Connection A: release pause and commit
+      assert(releaseQuote, 'Release function should be available');
+      releaseQuote!();
+      await quotePromise;
+      assert(quoteCreated, 'Quote should have been created');
+      await clientA.query('COMMIT');
+
+      // Wait for B's price update to complete
+      await pricePromise;
+      assert(priceUpdated, 'Price update should complete after quote commit');
+
+      // Verify quote uses old price (0.05 = 50,000 base units)
+      assert.strictEqual(
+        quoteRow.total_price_usdc,
+        '0.050000',
+        'Quote should use original price 0.05 USDC'
+      );
+      assert.strictEqual(
+        (quoteRow as any).total_base_units,
+        50_000n,
+        'Quote total should be 50,000 base units'
+      );
+
+      // Verify snapshot retains old price
+      const snapshots = await getQuoteSources(quoteRow.id);
+      assert.strictEqual(
+        snapshots[0].document_price_base_units,
+        '50000',
+        'Snapshot price should remain at 0.05 USDC'
+      );
+
+      // Verify DB price is now updated
+      const docPrice = await query<{ price_per_query_usdc: string }>(
+        'SELECT price_per_query_usdc FROM documents WHERE id = $1',
+        [docId]
+      );
+      assert.strictEqual(docPrice.rows[0].price_per_query_usdc, '0.100000', 'Document price should be updated to 0.10');
+
+    } finally {
+      try { await clientA.query('ROLLBACK'); } catch {}
+      clientA.release();
+      if (clientB) {
+        try { await clientB.query('ROLLBACK'); } catch {}
+        clientB.release();
+      }
+      try { await clientC.query('ROLLBACK'); } catch {}
+      clientC.release();
+      await removeConcurrencyFixture(docId, wallet);
+    }
+  });
+
+  // ------------------------------------------------------------------
   // Cleanup
   // ------------------------------------------------------------------
 
@@ -6402,7 +7452,13 @@ if (HAS_DB) {
   }
 }
 
-runSuite().catch((err) => {
+runSuite().then(() => process.exit(0)).catch((err) => {
   console.error('Fatal suite error:', err);
   process.exit(1);
 });
+
+// Safety net: force exit after 60 seconds if something hangs
+setTimeout(() => {
+  console.error('Suite timed out after 60 seconds');
+  process.exit(1);
+}, 60000).unref();

@@ -364,6 +364,28 @@ async function evaluateMethod(
   };
 }
 
+/**
+ * Pure decision logic: are all three evaluation methods complete enough to
+ * compare hybrid vs FTS? Returns true only when:
+ *   - FTS-only is complete (no FTS or query failures),
+ *   - semantic-only is complete (no semantic or query failures, or no provider),
+ *   - hybrid is complete (no FTS/semantic/query failures AND both paths used).
+ */
+export function areEvaluationMethodsComparable(
+  fts: EvalResult,
+  semantic: EvalResult | null,
+  hybrid: EvalResult
+): boolean {
+  const ftsComplete = fts.diagnostics.complete;
+  const semanticComplete =
+    semantic !== null && semantic.diagnostics.complete;
+  const hybridComplete =
+    hybrid.diagnostics.complete &&
+    hybrid.diagnostics.pathsUsed.includes('fts') &&
+    hybrid.diagnostics.pathsUsed.includes('semantic');
+  return ftsComplete && semanticComplete && hybridComplete;
+}
+
 async function main() {
   console.log('=== CiteRail Retrieval Evaluation ===');
   console.log('');
@@ -526,14 +548,12 @@ async function main() {
   // (semantic path executed for every query), and hybrid must be complete
   // (both FTS and semantic executed for every query).
   console.log('=== Comparison Summary ===');
-  const ftsComplete = ftsResult.diagnostics.complete;
-  const semanticComplete =
-    semanticResult !== null && semanticResult.diagnostics.complete;
-  const hybridComplete =
-    hybridResult.diagnostics.complete &&
-    hybridResult.diagnostics.pathsUsed.includes('fts') &&
-    hybridResult.diagnostics.pathsUsed.includes('semantic');
-  if (ftsComplete && semanticComplete && hybridComplete) {
+  const comparable = areEvaluationMethodsComparable(
+    ftsResult,
+    semanticResult,
+    hybridResult
+  );
+  if (comparable) {
     const hybridVsFtsRecall5 = hybridResult.recallAt5 - ftsResult.recallAt5;
     const hybridVsFtsMRR = hybridResult.mrrAt10 - ftsResult.mrrAt10;
     console.log(
@@ -551,12 +571,12 @@ async function main() {
     }
   } else {
     const reasons: string[] = [];
-    if (!ftsComplete) {
+    if (!ftsResult.diagnostics.complete) {
       reasons.push(
         `FTS baseline incomplete (${ftsResult.diagnostics.ftsFailures} FTS failure(s), ${ftsResult.diagnostics.queryFailures} query failure(s))`
       );
     }
-    if (!semanticComplete) {
+    if (!semanticResult || !semanticResult.diagnostics.complete) {
       const semFailures = semanticResult
         ? semanticResult.diagnostics.semanticFailures
         : 'N/A (no provider)';
@@ -564,7 +584,11 @@ async function main() {
         `Semantic-only incomplete (${semFailures} semantic failure(s))`
       );
     }
-    if (!hybridComplete) {
+    if (
+      !hybridResult.diagnostics.complete ||
+      !hybridResult.diagnostics.pathsUsed.includes('fts') ||
+      !hybridResult.diagnostics.pathsUsed.includes('semantic')
+    ) {
       reasons.push(
         `Hybrid incomplete (${hybridResult.diagnostics.ftsFailures} FTS failure(s), ${hybridResult.diagnostics.semanticFailures} semantic failure(s))`
       );
