@@ -69,7 +69,7 @@ export interface PaymentQuote {
  * @param chunkIds Requested chunk IDs (duplicates are removed; empty array is valid).
  * @throws IneligibleSourceError if any requested chunk is missing or ineligible.
  */
-async function loadEligibleChunksForQuote(
+export async function loadEligibleChunksForQuote(
   client: PoolClient,
   chunkIds: string[]
 ): Promise<ChunkRecord[]> {

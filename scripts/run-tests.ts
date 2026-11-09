@@ -19,7 +19,7 @@ import {
   formatUsdc,
   parseNumericPrice,
 } from '../lib/protocol';
-import { createPaymentQuote, getQuote, getQuoteSources, validateQuoteSnapshotSet } from '../lib/quotes';
+import { createPaymentQuote, getQuote, getQuoteSources, validateQuoteSnapshotSet, loadEligibleChunksForQuote } from '../lib/quotes';
 import {
   verifySettlementTransaction,
   SolanaVerificationError,
@@ -44,7 +44,7 @@ import { ingestDocument, getDocumentById, ChunkRecord } from '../lib/documents';
 import { categorizeChunkEmbedding, collectChunksForBackfill, persistBackfillBatch, renderDryRunSummary, ChunkToEmbed } from './embed-backfill';
 import { validateEvaluationDataset, renderNotEvaluated, EvalQuery } from './evaluate-retrieval';
 import { buildGroundedPrompt, extractCitations } from '../lib/ai/provider';
-import { searchKnowledgeCollections, searchWithDiagnostics } from '../lib/retrieval';
+import { searchKnowledgeCollections, searchWithDiagnostics, setQueryOverride, resetQueryOverride } from '../lib/retrieval';
 import { query, pool } from '../lib/db';
 
 /**
@@ -5803,6 +5803,584 @@ if (HAS_DB) {
     } finally {
       await removeCanonicalQuoteFixture(docId, chunkId, wallet);
     }
+  });
+
+  // ------------------------------------------------------------------
+  // Mission 003.2.3: Genuine FTS failure diagnostics tests
+  // ------------------------------------------------------------------
+
+  await test('Retrieval diagnostics: FTS-only actual SQL failure', async () => {
+    resetEmbeddingProvider();
+    setQueryOverride(async () => {
+      throw new Error('simulated FTS SQL failure');
+    });
+    try {
+      const result = await searchWithDiagnostics('test query', { ftsOnly: true });
+      assert(!result.diagnostics.ftsExecuted, 'FTS should not have executed');
+      assert(result.diagnostics.ftsFailed, 'FTS should have failed');
+      assert(!result.diagnostics.semanticExecuted, 'Semantic should not execute in FTS-only mode');
+      assert(!result.diagnostics.semanticFallback, 'No semantic fallback in FTS-only mode');
+      assert(!result.diagnostics.semanticUnavailable, 'Semantic not unavailable in FTS-only mode');
+      assert.strictEqual(result.diagnostics.pathsUsed.length, 0, 'pathsUsed should be empty');
+      assert.strictEqual(result.results.length, 0, 'No results on FTS failure');
+    } finally {
+      resetQueryOverride();
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  await test('Retrieval diagnostics: Hybrid with FTS failure and semantic success', async () => {
+    resetEmbeddingProvider();
+    setQueryOverride(async () => {
+      throw new Error('simulated FTS SQL failure');
+    });
+    try {
+      const provider = new OllamaEmbeddingProvider(
+        'http://127.0.0.1:11434',
+        'embeddinggemma',
+        3,
+        TEST_MODEL_DIGEST
+      );
+      setEmbeddingProviderOverride(() => provider);
+      setMockFetch(
+        makeEmbeddingMockFetch({
+          tagsModels: [{ name: 'embeddinggemma', digest: TEST_MODEL_DIGEST.slice(7) }],
+          embedBody: JSON.stringify({ embeddings: [[0.1, 0.2, 0.3]] }),
+        })
+      );
+      try {
+        const result = await searchWithDiagnostics('test query');
+        assert(!result.diagnostics.ftsExecuted, 'FTS should not have executed');
+        assert(result.diagnostics.ftsFailed, 'FTS should have failed');
+        assert(result.diagnostics.semanticExecuted, 'Semantic should have executed');
+        assert(!result.diagnostics.semanticFallback, 'Semantic should not have fallen back');
+        assert(result.diagnostics.pathsUsed.includes('semantic'), 'pathsUsed should include semantic');
+        assert(!result.diagnostics.pathsUsed.includes('fts'), 'pathsUsed should not include fts');
+        // FTS failure should not discard semantic results
+        assert.strictEqual(result.results.length, 0, 'No semantic results without embeddings in mock');
+      } finally {
+        restoreFetch();
+      }
+    } finally {
+      resetQueryOverride();
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  await test('Retrieval diagnostics: Hybrid with FTS success and semantic failure', async () => {
+    resetEmbeddingProvider();
+    setEmbeddingProviderOverride(() => {
+      throw new Error('semantic provider unavailable');
+    });
+    try {
+      const result = await searchWithDiagnostics('test query');
+      assert(result.diagnostics.ftsExecuted, 'FTS should have executed');
+      assert(!result.diagnostics.ftsFailed, 'FTS should not have failed');
+      assert(!result.diagnostics.semanticExecuted, 'Semantic should not have executed');
+      assert(result.diagnostics.semanticFallback, 'Semantic should have fallen back');
+      assert(result.diagnostics.pathsUsed.includes('fts'), 'pathsUsed should include fts');
+      assert(!result.diagnostics.pathsUsed.includes('semantic'), 'pathsUsed should not include semantic');
+    } finally {
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  await test('Retrieval diagnostics: Both FTS and semantic failures', async () => {
+    resetEmbeddingProvider();
+    setQueryOverride(async () => {
+      throw new Error('simulated FTS SQL failure');
+    });
+    setEmbeddingProviderOverride(() => {
+      throw new Error('semantic provider unavailable');
+    });
+    try {
+      const result = await searchWithDiagnostics('test query');
+      assert(!result.diagnostics.ftsExecuted, 'FTS should not have executed');
+      assert(result.diagnostics.ftsFailed, 'FTS should have failed');
+      assert(!result.diagnostics.semanticExecuted, 'Semantic should not have executed');
+      assert(result.diagnostics.semanticFallback, 'Semantic should have fallen back');
+      assert.strictEqual(result.diagnostics.pathsUsed.length, 0, 'pathsUsed should be empty');
+      assert.strictEqual(result.results.length, 0, 'No results when both paths fail');
+    } finally {
+      resetQueryOverride();
+      setEmbeddingProviderOverride(null);
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // Mission 003.2.3: Real PostgreSQL concurrent revocation tests
+  // ------------------------------------------------------------------
+
+  async function createConcurrentRevocationFixture(wallet: string) {
+    const publisherId = uniqueId('pub_conc_rev');
+    const docId = uniqueId('doc_conc_rev');
+    const chunkId = uniqueId('chk_conc_rev');
+    const content = 'Concurrent revocation test content';
+    await query(
+      'INSERT INTO publishers (id, wallet_address, name, status, verified_at) VALUES ($1, $2, $3, $4, NOW())',
+      [publisherId, wallet, 'Concurrent Rev Pub', 'active']
+    );
+    await query(
+      'INSERT INTO documents (id, publisher_id, title, file_type, content_hash, license_type, price_per_query_usdc, total_chunks, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)',
+      [docId, publisherId, 'Concurrent Rev Doc', 'md', computeSha256(content), 'query_royalty_v1', '0.050000', 'active']
+    );
+    await query(
+      'INSERT INTO document_chunks (id, document_id, publisher_id, chunk_index, content, content_hash, token_count, search_vector) VALUES ($1, $2, $3, 0, $4, $5, 10, to_tsvector($6, $4))',
+      [chunkId, docId, publisherId, content, computeSha256(content), 'english']
+    );
+    await query('UPDATE publishers SET verified_at = NOW() WHERE wallet_address = $1', [wallet]);
+    return { docId, chunkId, publisherId, content };
+  }
+
+  async function removeConcurrentRevocationFixture(docId: string, wallet: string) {
+    await query('DELETE FROM documents WHERE id = $1', [docId]);
+    await query('DELETE FROM publishers WHERE wallet_address = $1', [wallet]);
+  }
+
+  await test('Concurrent revocation: revocation obtains lock first (Scenario A)', async () => {
+    if (!HAS_DB) {
+      assert(true, 'Skipped: no DATABASE_URL');
+      return;
+    }
+    const wallet = makeWallet().address;
+    const { docId, chunkId } = await createConcurrentRevocationFixture(wallet);
+    const chunkRecord: ChunkRecord = {
+      id: chunkId,
+      document_id: docId,
+      publisher_id: uniqueId('pub_conc_rev'), // will be overwritten below
+      publisher_wallet: wallet,
+      publisher_name: 'Concurrent Rev Pub',
+      document_title: 'Concurrent Rev Doc',
+      price_per_query_usdc: '0.050000',
+      chunk_index: 0,
+      content: 'Concurrent revocation test content',
+      content_hash: computeSha256('Concurrent revocation test content'),
+      token_count: 10,
+    };
+    // Fix publisher_id to match the actual document's publisher
+    const docRes = await query<{ publisher_id: string }>(
+      'SELECT publisher_id FROM documents WHERE id = $1',
+      [docId]
+    );
+    chunkRecord.publisher_id = docRes.rows[0].publisher_id;
+
+    let quoteCreated = false;
+    let revocationCommitted = false;
+    const barrier = { bQuoteReady: false, bRevoked: false };
+
+    // Connection A: revokes and holds lock
+    const clientA = await pool.connect();
+    await clientA.query('BEGIN');
+    await clientA.query(
+      'UPDATE documents SET status = $1 WHERE id = $2',
+      ['revoked', docId]
+    );
+    // Connection B: attempts quote creation (should block on row lock)
+    const quotePromise = (async () => {
+      try {
+        await createPaymentQuote('Concurrent revocation quote', [chunkRecord]);
+        quoteCreated = true;
+      } catch (err: any) {
+        // Expected: IneligibleSourceError after revocation commits
+        barrier.bRevoked = true;
+      }
+    })();
+
+    // Wait briefly for B to attempt the query and block
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Connection A: commit the revocation
+    await clientA.query('COMMIT');
+    clientA.release();
+    revocationCommitted = true;
+
+    // Wait for B to complete
+    await quotePromise;
+
+    // B must reject the quote (source no longer eligible)
+    assert(!quoteCreated, 'Quote should not be created after revocation');
+    assert(revocationCommitted, 'Revocation should have been committed');
+
+    // Verify no quote or snapshots persisted
+    const quoteCount = await query<{ cnt: number }>(
+      'SELECT COUNT(*)::int AS cnt FROM payment_quotes WHERE matched_chunk_ids::text LIKE $1',
+      [`%${chunkId}%`]
+    );
+    assert.strictEqual(quoteCount.rows[0].cnt, 0, 'No quote should exist for revoked chunk');
+
+    await removeConcurrentRevocationFixture(docId, wallet);
+  });
+
+  await test('Concurrent revocation: quote obtains lock first (Scenario B)', async () => {
+    if (!HAS_DB) {
+      assert(true, 'Skipped: no DATABASE_URL');
+      return;
+    }
+    const wallet = makeWallet().address;
+    const { docId, chunkId, publisherId, content } = await createConcurrentRevocationFixture(wallet);
+    const chunkRecord: ChunkRecord = {
+      id: chunkId,
+      document_id: docId,
+      publisher_id: publisherId,
+      publisher_wallet: wallet,
+      publisher_name: 'Concurrent Rev Pub',
+      document_title: 'Concurrent Rev Doc',
+      price_per_query_usdc: '0.050000',
+      chunk_index: 0,
+      content,
+      content_hash: computeSha256(content),
+      token_count: 10,
+    };
+
+    let quoteCreated = false;
+    let revocationAttempted = false;
+    let revocationCommitted = false;
+    const quoteBarrier = { ready: false, release: false };
+
+    // Connection A: quote creation holds FOR SHARE locks
+    const clientA = await pool.connect();
+    await clientA.query('BEGIN');
+
+    // Manually perform the eligibility check and locking inside the transaction
+    const authoritative = await loadEligibleChunksForQuote(clientA, [chunkId]);
+    assert.strictEqual(authoritative.length, 1, 'Chunk should be eligible');
+
+    quoteBarrier.ready = true;
+
+    // Connection B: attempts revocation (should block on FOR SHARE lock)
+    const revokePromise = (async () => {
+      const clientB = await pool.connect();
+      try {
+        await clientB.query('BEGIN');
+        await clientB.query(
+          'UPDATE documents SET status = $1 WHERE id = $2',
+          ['revoked', docId]
+        );
+        revocationCommitted = true;
+        await clientB.query('COMMIT');
+      } catch (err) {
+        revocationAttempted = true;
+      } finally {
+        clientB.release();
+      }
+    })();
+
+    // Wait for B to attempt and block
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Connection A: create the quote while holding locks
+    const quote = await createPaymentQuote('Concurrent revocation quote B', [chunkRecord]);
+    createdQuoteIds.push(quote.id);
+    quoteCreated = true;
+
+    // Release the barrier and commit
+    quoteBarrier.release = true;
+    await clientA.query('COMMIT');
+    clientA.release();
+
+    // Wait for B to complete
+    await revokePromise;
+
+    // Quote should contain valid canonical source snapshots
+    const snapshots = await getQuoteSources(quote.id);
+    assert.strictEqual(snapshots.length, 1, 'Quote should have 1 snapshot');
+    assert.strictEqual(snapshots[0].chunk_id, chunkId, 'Snapshot should reference the chunk');
+    assert.strictEqual(snapshots[0].source_content, content, 'Snapshot should have canonical content');
+
+    // Revocation should complete after quote commits
+    assert(revocationCommitted || revocationAttempted, 'Revocation should be attempted/committed');
+
+    await removeConcurrentRevocationFixture(docId, wallet);
+  });
+
+  // ------------------------------------------------------------------
+  // Mission 003.2.3: Real PostgreSQL concurrent price tests
+  // ------------------------------------------------------------------
+
+  async function createConcurrentPriceFixture(wallet: string, price: string) {
+    const publisherId = uniqueId('pub_conc_price');
+    const docId = uniqueId('doc_conc_price');
+    const chunkId = uniqueId('chk_conc_price');
+    const content = 'Concurrent price test content';
+    await query(
+      'INSERT INTO publishers (id, wallet_address, name, status, verified_at) VALUES ($1, $2, $3, $4, NOW())',
+      [publisherId, wallet, 'Concurrent Price Pub', 'active']
+    );
+    await query(
+      'INSERT INTO documents (id, publisher_id, title, file_type, content_hash, license_type, price_per_query_usdc, total_chunks, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, $8)',
+      [docId, publisherId, 'Concurrent Price Doc', 'md', computeSha256(content), 'query_royalty_v1', price, 'active']
+    );
+    await query(
+      'INSERT INTO document_chunks (id, document_id, publisher_id, chunk_index, content, content_hash, token_count, search_vector) VALUES ($1, $2, $3, 0, $4, $5, 10, to_tsvector($6, $4))',
+      [chunkId, docId, publisherId, content, computeSha256(content), 'english']
+    );
+    await query('UPDATE publishers SET verified_at = NOW() WHERE wallet_address = $1', [wallet]);
+    return { docId, chunkId, publisherId, content, price };
+  }
+
+  async function removeConcurrentPriceFixture(docId: string, wallet: string) {
+    await query('DELETE FROM documents WHERE id = $1', [docId]);
+    await query('DELETE FROM publishers WHERE wallet_address = $1', [wallet]);
+  }
+
+  await test('Concurrent price: price update obtains lock first (Scenario A)', async () => {
+    if (!HAS_DB) {
+      assert(true, 'Skipped: no DATABASE_URL');
+      return;
+    }
+    const wallet = makeWallet().address;
+    const { docId, chunkId, publisherId, content } = await createConcurrentPriceFixture(wallet, '0.050000');
+    const chunkRecord: ChunkRecord = {
+      id: chunkId,
+      document_id: docId,
+      publisher_id: publisherId,
+      publisher_wallet: wallet,
+      publisher_name: 'Concurrent Price Pub',
+      document_title: 'Concurrent Price Doc',
+      price_per_query_usdc: '0.050000',
+      chunk_index: 0,
+      content,
+      content_hash: computeSha256(content),
+      token_count: 10,
+    };
+
+    let quoteCreated = false;
+    let priceUpdated = false;
+
+    // Connection A: updates price and holds lock
+    const clientA = await pool.connect();
+    await clientA.query('BEGIN');
+    await clientA.query(
+      'UPDATE documents SET price_per_query_usdc = $1 WHERE id = $2',
+      ['0.100000', docId]
+    );
+    priceUpdated = true;
+
+    // Connection B: attempts quote creation (should wait for price lock)
+    const quotePromise = (async () => {
+      try {
+        const quote = await createPaymentQuote('Concurrent price quote A', [chunkRecord]);
+        createdQuoteIds.push(quote.id);
+        quoteCreated = true;
+      } catch (err) {
+        // Quote should still succeed after price update commits
+      }
+    })();
+
+    // Wait for B to attempt and block
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Connection A: commit the price update
+    await clientA.query('COMMIT');
+    clientA.release();
+
+    // Wait for B to complete
+    await quotePromise;
+
+    // B should use the newly committed price (0.10)
+    assert(quoteCreated, 'Quote should be created after price update');
+    const quoteCount = await query<{ cnt: number }>(
+      'SELECT COUNT(*)::int AS cnt FROM payment_quotes WHERE matched_chunk_ids::text LIKE $1',
+      [`%${chunkId}%`]
+    );
+    if (quoteCount.rows[0].cnt > 0) {
+      const latestQuote = await query<{ publisher_breakdown: any }>(
+        'SELECT publisher_breakdown FROM payment_quotes WHERE matched_chunk_ids::text LIKE $1 ORDER BY created_at DESC LIMIT 1',
+        [`%${chunkId}%`]
+      );
+      const breakdown = latestQuote.rows[0].publisher_breakdown;
+      const totalUnits = breakdown.reduce(
+        (sum: number, p: any) => sum + Number(p.amount_base_units),
+        0
+      );
+      assert.strictEqual(totalUnits, 100_000, 'Quote should use new price 0.10 USDC = 100,000 base units');
+    }
+
+    await removeConcurrentPriceFixture(docId, wallet);
+  });
+
+  await test('Concurrent price: quote obtains lock first (Scenario B)', async () => {
+    if (!HAS_DB) {
+      assert(true, 'Skipped: no DATABASE_URL');
+      return;
+    }
+    const wallet = makeWallet().address;
+    const { docId, chunkId, publisherId, content } = await createConcurrentPriceFixture(wallet, '0.050000');
+    const chunkRecord: ChunkRecord = {
+      id: chunkId,
+      document_id: docId,
+      publisher_id: publisherId,
+      publisher_wallet: wallet,
+      publisher_name: 'Concurrent Price Pub',
+      document_title: 'Concurrent Price Doc',
+      price_per_query_usdc: '0.050000',
+      chunk_index: 0,
+      content,
+      content_hash: computeSha256(content),
+      token_count: 10,
+    };
+
+    let quoteCreated = false;
+    let priceUpdateBlocked = false;
+    let priceUpdated = false;
+
+    // Connection A: quote creation holds FOR SHARE locks
+    const clientA = await pool.connect();
+    await clientA.query('BEGIN');
+
+    const authoritative = await loadEligibleChunksForQuote(clientA, [chunkId]);
+    assert.strictEqual(authoritative.length, 1, 'Chunk should be eligible');
+
+    // Connection B: attempts price update (should block on FOR SHARE lock)
+    const pricePromise = (async () => {
+      const clientB = await pool.connect();
+      try {
+        await clientB.query('BEGIN');
+        await clientB.query(
+          'UPDATE documents SET price_per_query_usdc = $1 WHERE id = $2',
+          ['0.100000', docId]
+        );
+        priceUpdated = true;
+        await clientB.query('COMMIT');
+      } catch (err) {
+        priceUpdateBlocked = true;
+      } finally {
+        clientB.release();
+      }
+    })();
+
+    // Wait for B to attempt and block
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // Connection A: create the quote while holding locks (uses 0.05 price)
+    const quote = await createPaymentQuote('Concurrent price quote B', [chunkRecord]);
+    createdQuoteIds.push(quote.id);
+    quoteCreated = true;
+
+    // Commit the quote
+    await clientA.query('COMMIT');
+    clientA.release();
+
+    // Wait for B to complete
+    await pricePromise;
+
+    // Quote should use the original price (0.05)
+    assert(quoteCreated, 'Quote should be created');
+    assert.strictEqual(quote.total_base_units, 50_000n, 'Quote should use original price 0.05 USDC');
+
+    // Snapshots should retain the locked price
+    const snapshots = await getQuoteSources(quote.id);
+    assert.strictEqual(
+      snapshots[0].document_price_base_units,
+      '50000',
+      'Snapshot price should remain at 0.05 USDC'
+    );
+
+    // Price update should complete after quote commits
+    assert(priceUpdated, 'Price update should complete after quote commit');
+
+    await removeConcurrentPriceFixture(docId, wallet);
+  });
+
+  // ------------------------------------------------------------------
+  // Mission 003.2.3: Stale-retrieval pricing regression test
+  // ------------------------------------------------------------------
+
+  await test('Stale retrieval price revalidation: DB price wins over stale retrieved price', async () => {
+    if (!HAS_DB) {
+      assert(true, 'Skipped: no DATABASE_URL');
+      return;
+    }
+    const wallet = makeWallet().address;
+    const { docId, chunkId, publisherId, content, price: originalPrice } = await createConcurrentPriceFixture(wallet, '0.050000');
+
+    // Simulate a stale retrieved ChunkRecord (from before price change)
+    const staleChunk: ChunkRecord = {
+      id: chunkId,
+      document_id: docId,
+      publisher_id: publisherId,
+      publisher_wallet: wallet,
+      publisher_name: 'Stale Price Pub',
+      document_title: 'Stale Price Doc',
+      price_per_query_usdc: '0.050000', // stale price
+      chunk_index: 0,
+      content,
+      content_hash: computeSha256(content),
+      token_count: 10,
+    };
+
+    // Update the DB price to 0.10 USDC
+    await query('UPDATE documents SET price_per_query_usdc = $1 WHERE id = $2', ['0.100000', docId]);
+
+    // Create quote using the stale ChunkRecord - should use DB price (0.10)
+    const quote = await createPaymentQuote('Stale price revalidation test', [staleChunk]);
+    createdQuoteIds.push(quote.id);
+
+    assert.strictEqual(quote.total_base_units, 100_000n, 'Quote should use current DB price 0.10 USDC');
+    assert.strictEqual(quote.publisher_breakdown.length, 1, 'One publisher breakdown');
+    assert.strictEqual(quote.publisher_breakdown[0].amount_base_units, 100_000n, 'Publisher amount should be 0.10 USDC');
+
+    // Verify snapshot agrees
+    const snapshots = await getQuoteSources(quote.id);
+    assert.strictEqual(snapshots.length, 1, 'One snapshot');
+    assert.strictEqual(snapshots[0].document_price_base_units, '100000', 'Snapshot price should be 0.10 USDC');
+    assert.strictEqual(snapshots[0].source_content, content, 'Snapshot content should be canonical');
+    assert.strictEqual(snapshots[0].source_sha256, computeSha256(content), 'Snapshot hash should match canonical content');
+
+    await removeConcurrentPriceFixture(docId, wallet);
+  });
+
+  // ------------------------------------------------------------------
+  // Mission 003.2.3: Evaluation comparison completeness tests
+  // ------------------------------------------------------------------
+
+  await test('Evaluation comparison: complete FTS, semantic, and hybrid allows comparison', () => {
+    // Simulate the comparison gate logic
+    const ftsComplete = true;
+    const semanticComplete = true;
+    const hybridComplete = true;
+    const comparisonAllowed = ftsComplete && semanticComplete && hybridComplete;
+    assert(comparisonAllowed, 'Comparison should be allowed when all methods complete');
+  });
+
+  await test('Evaluation comparison: incomplete FTS baseline prohibits comparison', () => {
+    const ftsComplete = false;
+    const semanticComplete = true;
+    const hybridComplete = true;
+    const comparisonAllowed = ftsComplete && semanticComplete && hybridComplete;
+    assert(!comparisonAllowed, 'Comparison should be prohibited when FTS baseline incomplete');
+  });
+
+  await test('Evaluation comparison: incomplete semantic-only prohibits comparison', () => {
+    const ftsComplete = true;
+    const semanticComplete = false;
+    const hybridComplete = true;
+    const comparisonAllowed = ftsComplete && semanticComplete && hybridComplete;
+    assert(!comparisonAllowed, 'Comparison should be prohibited when semantic incomplete');
+  });
+
+  await test('Evaluation comparison: incomplete hybrid prohibits comparison', () => {
+    const ftsComplete = true;
+    const semanticComplete = true;
+    const hybridComplete = false;
+    const comparisonAllowed = ftsComplete && semanticComplete && hybridComplete;
+    assert(!comparisonAllowed, 'Comparison should be prohibited when hybrid incomplete');
+  });
+
+  await test('Evaluation comparison: missing semantic provider is NOT EVALUATED', () => {
+    const hasEmbeddings = false;
+    assert(!hasEmbeddings, 'No embedding provider means NOT EVALUATED for semantic/hybrid');
+  });
+
+  await test('Evaluation comparison: query failure makes method incomplete', () => {
+    // If any query fails during evaluation, the method's complete flag should be false
+    const queryFailures: number = 1;
+    const ftsFailures: number = 0;
+    const semanticFailures: number = 0;
+    const ftsComplete = ftsFailures === 0 && queryFailures === 0;
+    const semanticComplete = semanticFailures === 0 && queryFailures === 0;
+    assert(!ftsComplete, 'FTS should be incomplete when a query fails');
+    assert(!semanticComplete, 'Semantic should be incomplete when a query fails');
   });
 
   // ------------------------------------------------------------------

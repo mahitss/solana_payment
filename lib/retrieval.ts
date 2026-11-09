@@ -4,6 +4,38 @@ import { getEmbeddingProvider, EmbeddingProvider } from './embedding';
 import { ELIGIBILITY_SQL_PREDICATE } from './eligibility';
 
 /**
+ * Test-only dependency injection for the query function used by FTS retrieval.
+ * Allows tests to simulate genuine PostgreSQL failures in the FTS path without
+ * altering production behavior. Set to undefined to restore normal operation.
+ */
+let queryOverride: ((text: string, params?: any[]) => Promise<{ rows: any[]; rowCount: number }>) | undefined =
+  undefined;
+
+export function setQueryOverride(
+  fn: ((text: string, params?: any[]) => Promise<{ rows: any[]; rowCount: number }>) | null
+): void {
+  queryOverride = fn ?? undefined;
+}
+
+export function resetQueryOverride(): void {
+  queryOverride = undefined;
+}
+
+function runQuery(text: string, params?: any[]): Promise<{ rows: any[]; rowCount: number }> {
+  if (queryOverride) {
+    return queryOverride(text, params);
+  }
+  return query(text, params);
+}
+
+/**
+ * Runs a query for the FTS path, respecting the test-only query override.
+ */
+function runFtsQuery(text: string, params?: any[]): Promise<{ rows: any[]; rowCount: number }> {
+  return runQuery(text, params);
+}
+
+/**
  * Minimum fraction of the significant query terms that must appear in a chunk
  * for it to be considered relevant when full-text ranking does not fire.
  */
@@ -97,7 +129,7 @@ async function ftsRetrieval(
     LIMIT $3;
   `;
 
-  const res = await query(sql, [cleanQuery, minCoverage, limit]);
+  const res = await runFtsQuery(sql, [cleanQuery, minCoverage, limit]);
 
   return res.rows.map((row: any, i: number) => ({
     chunk: {

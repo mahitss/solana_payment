@@ -521,16 +521,19 @@ async function main() {
   if (semanticResult) printResult(semanticResult);
   printResult(hybridResult);
 
-  // Comparison summary — only ever stated when a semantic run actually took
-  // place, executed the semantic path for every query, and the labels stayed
-  // identical across methods.
+  // Comparison summary — only ever stated when all three methods are complete:
+  // FTS-only must be complete (valid baseline), semantic-only must be complete
+  // (semantic path executed for every query), and hybrid must be complete
+  // (both FTS and semantic executed for every query).
   console.log('=== Comparison Summary ===');
-  const hybridComplete =
-    hybridResult.diagnostics.complete &&
-    hybridResult.diagnostics.pathsUsed.includes('semantic');
+  const ftsComplete = ftsResult.diagnostics.complete;
   const semanticComplete =
     semanticResult !== null && semanticResult.diagnostics.complete;
-  if (semanticResult && semanticComplete && hybridComplete) {
+  const hybridComplete =
+    hybridResult.diagnostics.complete &&
+    hybridResult.diagnostics.pathsUsed.includes('fts') &&
+    hybridResult.diagnostics.pathsUsed.includes('semantic');
+  if (ftsComplete && semanticComplete && hybridComplete) {
     const hybridVsFtsRecall5 = hybridResult.recallAt5 - ftsResult.recallAt5;
     const hybridVsFtsMRR = hybridResult.mrrAt10 - ftsResult.mrrAt10;
     console.log(
@@ -546,20 +549,28 @@ async function main() {
         'Hybrid retrieval does not show measured improvement on this evaluation set.'
       );
     }
-  } else if (semanticResult && !semanticComplete) {
-    console.log(
-      `Hybrid comparison NOT made: the semantic run was incomplete ` +
-        `(${semanticResult.diagnostics.semanticFailures} query/queries fell back or failed). ` +
-        'No hybrid metrics are reported as successful.'
-    );
-  } else if (semanticResult && !hybridComplete) {
-    console.log(
-      `Hybrid run INCOMPLETE: ${hybridResult.diagnostics.semanticFailures} query/queries ` +
-        'fell back to FTS. Hybrid metrics are not reported as a complete hybrid result.'
-    );
   } else {
+    const reasons: string[] = [];
+    if (!ftsComplete) {
+      reasons.push(
+        `FTS baseline incomplete (${ftsResult.diagnostics.ftsFailures} FTS failure(s), ${ftsResult.diagnostics.queryFailures} query failure(s))`
+      );
+    }
+    if (!semanticComplete) {
+      const semFailures = semanticResult
+        ? semanticResult.diagnostics.semanticFailures
+        : 'N/A (no provider)';
+      reasons.push(
+        `Semantic-only incomplete (${semFailures} semantic failure(s))`
+      );
+    }
+    if (!hybridComplete) {
+      reasons.push(
+        `Hybrid incomplete (${hybridResult.diagnostics.ftsFailures} FTS failure(s), ${hybridResult.diagnostics.semanticFailures} semantic failure(s))`
+      );
+    }
     console.log(
-      'Hybrid comparison NOT made: semantic evaluation was not performed (no embedding provider).'
+      'Hybrid comparison NOT made: ' + reasons.join('; ') + '. No hybrid metrics are reported as successful.'
     );
   }
 
