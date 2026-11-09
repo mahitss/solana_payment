@@ -137,6 +137,33 @@ async function migrate() {
     `);
 
     // ------------------------------------------------------------------
+    // Persisted embedding attempt status.
+    //
+    // Reports what ACTUALLY happened during the most recent ingestion
+    // attempt: 'pending' (no attempt recorded), 'skipped' (provider
+    // disabled), 'completed', 'partial', or 'failed'. Derived drift
+    // (stale content / outdated model versions) is computed at read time in
+    // lib/documents.ts and never overwrites this attempt record.
+    // ------------------------------------------------------------------
+    await client.query(`
+      ALTER TABLE documents ADD COLUMN IF NOT EXISTS embedding_status VARCHAR(20) NOT NULL DEFAULT 'pending';
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'documents_embedding_status_check'
+            AND conrelid = 'documents'::regclass
+        ) THEN
+          ALTER TABLE documents
+            ADD CONSTRAINT documents_embedding_status_check
+            CHECK (embedding_status IN
+              ('pending', 'skipped', 'completed', 'partial', 'failed'));
+        END IF;
+      END $$;
+    `);
+    // ------------------------------------------------------------------
     // Document chunks
     // ------------------------------------------------------------------
     await client.query(`
@@ -200,6 +227,13 @@ async function migrate() {
 
     // Backfill existing embedding rows: set model_digest to empty string
     // where NULL, then enforce NOT NULL.
+    //
+    // Rows whose digest is the empty string are LEGACY records from before
+    // verified model identity existed. They are never matched by semantic
+    // retrieval (which filters on the provider's real verified digest) and
+    // must re-run through the backfill to gain a genuine model identity.
+    // The historical vectors are PRESERVED — re-running this migration never
+    // deletes or overwrites valid historical embedding versions.
     await client.query(`
       UPDATE document_chunk_embeddings
       SET model_digest = ''
@@ -214,6 +248,26 @@ async function migrate() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_embeddings_chunk
         ON document_chunk_embeddings(chunk_id);
+    `);
+
+    // Legacy documents created before embedding_status existed approximate
+    // their attempt state from what is actually on disk: a document whose
+    // chunks carry hash-matching embeddings is treated as completed,
+    // everything else becomes pending so the backfill run can triage it
+    // honestly. Runs only after document_chunks and
+    // document_chunk_embeddings exist so this migration is safe on a fresh
+    // database as well as existing installations.
+    await client.query(`
+      UPDATE documents d
+      SET embedding_status = CASE WHEN EXISTS (
+            SELECT 1 FROM document_chunks c
+            JOIN document_chunk_embeddings e ON e.chunk_id = c.id
+            WHERE c.document_id = d.id AND e.source_hash = c.content_hash
+          ) THEN 'completed' ELSE 'pending' END
+      WHERE d.embedding_status = 'pending'
+        AND EXISTS (
+          SELECT 1 FROM document_chunks c WHERE c.document_id = d.id
+        );
     `);
 
     // Note: HNSW vector index is intentionally not created here because

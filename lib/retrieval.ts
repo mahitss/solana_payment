@@ -1,7 +1,39 @@
 import { query } from './db';
 import { ChunkRecord } from './documents';
-import { getEmbeddingProvider } from './embedding';
+import { getEmbeddingProvider, EmbeddingProvider } from './embedding';
 import { ELIGIBILITY_SQL_PREDICATE } from './eligibility';
+
+/**
+ * Test-only dependency injection for the query function used by FTS retrieval.
+ * Allows tests to simulate genuine PostgreSQL failures in the FTS path without
+ * altering production behavior. Set to undefined to restore normal operation.
+ */
+let queryOverride: ((text: string, params?: any[]) => Promise<{ rows: any[]; rowCount: number }>) | undefined =
+  undefined;
+
+export function setQueryOverride(
+  fn: ((text: string, params?: any[]) => Promise<{ rows: any[]; rowCount: number }>) | null
+): void {
+  queryOverride = fn ?? undefined;
+}
+
+export function resetQueryOverride(): void {
+  queryOverride = undefined;
+}
+
+function runQuery(text: string, params?: any[]): Promise<{ rows: any[]; rowCount: number }> {
+  if (queryOverride) {
+    return queryOverride(text, params);
+  }
+  return query(text, params);
+}
+
+/**
+ * Runs a query for the FTS path, respecting the test-only query override.
+ */
+function runFtsQuery(text: string, params?: any[]): Promise<{ rows: any[]; rowCount: number }> {
+  return runQuery(text, params);
+}
 
 /**
  * Minimum fraction of the significant query terms that must appear in a chunk
@@ -83,7 +115,7 @@ async function ftsRetrieval(
           ) / array_length(qt.terms, 1)
         END AS term_coverage
       FROM document_chunks c
-      JOIN documents d ON c.document_id = d.id
+      JOIN documents d ON c.document_id = d.id AND c.publisher_id = d.publisher_id
       JOIN publishers p ON c.publisher_id = p.id
       CROSS JOIN query_terms qt
       WHERE ${ELIGIBILITY_SQL_PREDICATE}
@@ -97,7 +129,7 @@ async function ftsRetrieval(
     LIMIT $3;
   `;
 
-  const res = await query(sql, [cleanQuery, minCoverage, limit]);
+  const res = await runFtsQuery(sql, [cleanQuery, minCoverage, limit]);
 
   return res.rows.map((row: any, i: number) => ({
     chunk: {
@@ -122,14 +154,17 @@ async function ftsRetrieval(
  * Semantic retrieval path using pgvector cosine distance.
  * Returns ranked candidates ordered by similarity (most similar first).
  * Applies the same eligibility predicate as the FTS path.
+ *
+ * Only embeddings whose (provider, model_id, dimensions, model_digest) tuple
+ * matches the verified identity of the CURRENT provider instance are
+ * considered. Legacy rows with unknown digests can never silently satisfy
+ * semantic retrieval.
  */
 async function semanticRetrieval(
+  provider: EmbeddingProvider,
   queryVector: number[],
   limit: number
 ): Promise<RankedCandidate[]> {
-  const provider = getEmbeddingProvider();
-  if (!provider) return [];
-
   const sql = `
     SELECT
       c.id,
@@ -146,7 +181,7 @@ async function semanticRetrieval(
       e.embedding <=> $1::vector AS cosine_distance
     FROM document_chunk_embeddings e
     JOIN document_chunks c ON e.chunk_id = c.id
-    JOIN documents d ON c.document_id = d.id
+    JOIN documents d ON c.document_id = d.id AND c.publisher_id = d.publisher_id
     JOIN publishers p ON c.publisher_id = p.id
     WHERE ${ELIGIBILITY_SQL_PREDICATE}
       AND e.provider = $2
@@ -165,7 +200,7 @@ async function semanticRetrieval(
     provider.providerId,
     provider.modelId,
     provider.dimensions,
-    '', // model_digest: Ollama embed API does not return a digest
+    provider.modelDigest,
     limit,
   ]);
 
@@ -227,15 +262,38 @@ function rrfFuse(
 }
 
 /**
- * Hybrid retrieval: combine FTS and semantic candidate rankings using RRF.
- *
- * If the embedding provider is unavailable, falls back to FTS-only.
- * If semantic returns no candidates, FTS results are still returned.
+ * Execution diagnostics for a single retrieval call. Evaluation uses these to
+ * report honestly which paths actually ran, so an FTS fallback is never
+ * mislabelled as a hybrid result. All flags reflect ACTUAL execution, not
+ * intended options.
  */
-export async function searchKnowledgeCollections(
+export interface RetrievalDiagnostics {
+  /** The FTS path executed (not skipped by semanticOnly). */
+  ftsExecuted: boolean;
+  /** The FTS path threw an error. */
+  ftsFailed: boolean;
+  /** The semantic path produced a query embedding and executed a search. */
+  semanticExecuted: boolean;
+  /** Semantic was attempted but failed; results are FTS-only. */
+  semanticFallback: boolean;
+  /** No embedding provider is configured/available at all. */
+  semanticUnavailable: boolean;
+  /** Retrieval paths that actually produced results, derived from execution. */
+  pathsUsed: string[];
+}
+
+/**
+ * Hybrid retrieval with explicit execution diagnostics.
+ *
+ * Behaviour is identical to `searchKnowledgeCollections` (graceful FTS
+ * fallback preserved for production), but the caller additionally learns
+ * which retrieval paths actually executed so evaluation reporting can stay
+ * truthful.
+ */
+export async function searchWithDiagnostics(
   userQuery: string,
   limitOrOptions: number | SearchOptions = 4
-): Promise<ChunkRecord[]> {
+): Promise<{ results: ChunkRecord[]; diagnostics: RetrievalDiagnostics }> {
   const options: SearchOptions =
     typeof limitOrOptions === 'number'
       ? { limit: limitOrOptions }
@@ -248,36 +306,67 @@ export async function searchKnowledgeCollections(
 
   const cleanQuery = userQuery.trim();
   if (!cleanQuery) {
-    return [];
+    return {
+      results: [],
+      diagnostics: {
+        ftsExecuted: false,
+        ftsFailed: false,
+        semanticExecuted: false,
+        semanticFallback: false,
+        semanticUnavailable: !ftsOnly,
+        pathsUsed: [],
+      },
+    };
   }
 
   const candidateLimit = DEFAULT_CANDIDATE_LIMIT;
+
+  const diagnostics: RetrievalDiagnostics = {
+    ftsExecuted: false,
+    ftsFailed: false,
+    semanticExecuted: false,
+    semanticFallback: false,
+    semanticUnavailable: false,
+    pathsUsed: [],
+  };
 
   // Path 1: Full-text retrieval (always runs unless semanticOnly).
   let ftsCandidates: RankedCandidate[] = [];
   if (!semanticOnly) {
     try {
       ftsCandidates = await ftsRetrieval(cleanQuery, candidateLimit, minCoverage);
+      diagnostics.ftsExecuted = true;
+      diagnostics.pathsUsed.push('fts');
     } catch (err) {
+      diagnostics.ftsFailed = true;
       console.error('FTS retrieval failed:', err);
     }
   }
 
   // Path 2: Semantic retrieval (runs unless ftsOnly; degrades gracefully).
+  // Provider initialization itself lives inside the failure handler: an
+  // invalid embedding configuration (or an unresolvable model identity) must
+  // never prevent the FTS path from operating.
   let semanticCandidates: RankedCandidate[] = [];
   if (!ftsOnly) {
-    const provider = getEmbeddingProvider();
-    if (provider) {
-      try {
+    try {
+      const provider = await getEmbeddingProvider();
+      if (provider) {
         const queryVector = await provider.embedQuery(cleanQuery);
-        semanticCandidates = await semanticRetrieval(queryVector, candidateLimit);
-      } catch (err) {
-        // Embedding failure is non-fatal: FTS results are still returned.
-        console.error(
-          'Semantic retrieval failed, falling back to FTS:',
-          err instanceof Error ? err.message : String(err)
-        );
+        semanticCandidates = await semanticRetrieval(provider, queryVector, candidateLimit);
+        diagnostics.semanticExecuted = true;
+        diagnostics.pathsUsed.push('semantic');
+      } else {
+        diagnostics.semanticUnavailable = true;
       }
+    } catch (err) {
+      // Embedding failure is non-fatal: FTS results are still returned, but
+      // the diagnostics record that the semantic path fell back.
+      diagnostics.semanticFallback = true;
+      console.error(
+        'Semantic retrieval failed, falling back to FTS:',
+        err instanceof Error ? err.message : String(err)
+      );
     }
   }
 
@@ -288,19 +377,44 @@ export async function searchKnowledgeCollections(
 
   const fused = rrfFuse(paths, RRF_K);
 
-  // Sort by fused score descending, then by chunk_index for deterministic tie-breaking.
+  // Sort by fused score descending, then fully deterministic tie-breaking:
+  // chunk_index ascending, then document_id ascending, then chunk_id
+  // ascending. Repeated runs over equal-scoring candidates always produce
+  // identical ordering.
   const sorted = Array.from(fused.values()).sort((a, b) => {
     if (b.fusedScore !== a.fusedScore) {
       return b.fusedScore - a.fusedScore;
     }
-    return a.chunk.chunk_index - b.chunk.chunk_index;
+    if (a.chunk.chunk_index !== b.chunk.chunk_index) {
+      return a.chunk.chunk_index - b.chunk.chunk_index;
+    }
+    const docCompare = a.chunk.document_id.localeCompare(b.chunk.document_id);
+    if (docCompare !== 0) return docCompare;
+    return a.chunk.id.localeCompare(b.chunk.id);
   });
 
   // Take the top `limit` results.
   const top = sorted.slice(0, limit);
 
-  return top.map((entry) => ({
-    ...entry.chunk,
-    score: entry.fusedScore,
-  }));
+  return {
+    results: top.map((entry) => ({
+      ...entry.chunk,
+      score: entry.fusedScore,
+    })),
+    diagnostics,
+  };
+}
+
+/**
+ * Hybrid retrieval: combine FTS and semantic candidate rankings using RRF.
+ *
+ * If the embedding provider is unavailable, falls back to FTS-only.
+ * If semantic returns no candidates, FTS results are still returned.
+ */
+export async function searchKnowledgeCollections(
+  userQuery: string,
+  limitOrOptions: number | SearchOptions = 4
+): Promise<ChunkRecord[]> {
+  const { results } = await searchWithDiagnostics(userQuery, limitOrOptions);
+  return results;
 }

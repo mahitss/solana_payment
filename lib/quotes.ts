@@ -1,8 +1,10 @@
 import crypto from 'crypto';
+import { PoolClient } from 'pg';
 import { query, withTransaction } from './db';
 import { ChunkRecord } from './documents';
 import { computeSha256 } from './chunker';
 import { config } from './config';
+import { ELIGIBILITY_SQL_PREDICATE, IneligibleSourceError } from './eligibility';
 import {
   SETTLEMENT_ASSET,
   buildMemoPayload,
@@ -53,25 +55,131 @@ export interface PaymentQuote {
   created_at: string;
 }
 
-export async function createPaymentQuote(
+/**
+ * Loads the authoritative chunk/document/publisher records for the requested
+ * chunk IDs inside an active transaction, applying the full eligibility
+ * predicate and row-locking the records for the duration of quote creation.
+ *
+ * Row locks are taken in a deterministic order (chunk_id) to reduce deadlock
+ * risk when multiple quote creations run concurrently against overlapping
+ * sources. The locks are held until the transaction commits or rolls back,
+ * so a concurrent revocation, price change, or content edit either blocks
+ * until the quote is committed, or is rejected if it committed first.
+ *
+ * @param chunkIds Requested chunk IDs (duplicates are removed; empty array is valid).
+ * @throws IneligibleSourceError if any requested chunk is missing or ineligible.
+ */
+export async function loadEligibleChunksForQuote(
+  client: PoolClient,
+  chunkIds: string[]
+): Promise<ChunkRecord[]> {
+  if (chunkIds.length === 0) return [];
+
+  // Deduplicate while preserving first-seen order so duplicate IDs are rejected
+  // deterministically downstream (the quote must price each chunk once).
+  const uniqueIds: string[] = [];
+  const seen = new Set<string>();
+  for (const id of chunkIds) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      uniqueIds.push(id);
+    }
+  }
+
+  const placeholders = uniqueIds.map((_, i) => `$${i + 1}`).join(', ');
+  const sql = `
+    SELECT c.id, c.document_id, c.publisher_id, c.chunk_index, c.content,
+           c.content_hash, c.token_count,
+           d.title AS document_title, d.price_per_query_usdc,
+           p.wallet_address AS publisher_wallet, p.name AS publisher_name
+    FROM document_chunks c
+    JOIN documents d ON c.document_id = d.id AND c.publisher_id = d.publisher_id
+    JOIN publishers p ON c.publisher_id = p.id
+    WHERE c.id IN (${placeholders})
+      AND ${ELIGIBILITY_SQL_PREDICATE}
+    ORDER BY c.id
+    FOR SHARE OF c, d, p
+  `;
+
+  const res = await client.query<ChunkRecord>(sql, uniqueIds);
+
+  const found = new Set(res.rows.map((r) => r.id));
+  const missing = uniqueIds.filter((id) => !found.has(id));
+  if (missing.length > 0) {
+    throw new IneligibleSourceError(missing);
+  }
+
+  return res.rows;
+}
+
+/**
+ * Internal transaction workflow shared by production quote creation and
+ * concurrency integration tests. Performs all authoritative source validation,
+ * eligibility, pricing, quote insertion, and source snapshot insertion inside
+ * a single PostgreSQL transaction with FOR SHARE row locks.
+ *
+ * If `pauseBeforeInsert` is set (test-only), the transaction pauses after
+ * acquiring FOR SHARE locks and before inserting quote/snapshot rows. The
+ * hook receives a `release` function; the transaction continues when
+ * `release()` is called.
+ */
+export async function runQuoteTransaction(
+  client: PoolClient,
   queryText: string,
   matchedChunks: ChunkRecord[],
-  buyerWallet: string | null = null,
-  expirySeconds: number = config.quoteExpirySeconds
-): Promise<PaymentQuote> {
-  if (matchedChunks.length === 0) {
-    throw new Error('Cannot create quote with zero matched chunks.');
+  buyerWallet: string | null,
+  expirySeconds: number,
+  pauseBeforeInsert?: (release: () => void) => void
+): Promise<{
+  quoteRow: any;
+  publisherBreakdown: PublisherPaymentBreakdown[];
+  totalBaseUnits: bigint;
+  totalPriceUsdc: string;
+}> {
+  const requestedIds = matchedChunks.map((c) => c.id);
+
+  // Reject duplicate chunk IDs up front: a chunk must be priced once per quote.
+  const uniqueRequestedIds: string[] = [];
+  const seenIds = new Set<string>();
+  for (const id of requestedIds) {
+    if (seenIds.has(id)) {
+      throw new IneligibleSourceError([id]);
+    }
+    seenIds.add(id);
+    uniqueRequestedIds.push(id);
   }
 
   const quoteId = `q_${crypto.randomUUID()}`;
   const quoteNonce = crypto.randomBytes(16).toString('hex');
+  const expiresAt = new Date(Date.now() + expirySeconds * 1000).toISOString();
 
-  // Group by publisher wallet (not publisher_id + document_id). A publisher
-  // who contributes chunks from multiple licensed documents receives one
-  // aggregated payment at their single USDC ATA. Individual document
-  // contributions are preserved separately in the `documents` array.
+  let publisherBreakdown: PublisherPaymentBreakdown[] = [];
+  let totalBaseUnits: bigint = BigInt(0);
+  let totalPriceUsdc: string = '0.000000';
+
+  // 1. Load authoritative chunk/document/publisher records, applying the
+  //    full eligibility predicate and locking the rows for this transaction.
+  const authoritative = await loadEligibleChunksForQuote(
+    client,
+    uniqueRequestedIds
+  );
+  const byId = new Map(authoritative.map((c) => [c.id, c]));
+
+  // 2. Confirm every requested chunk was returned eligible.
+  const missing = uniqueRequestedIds.filter((id) => !byId.has(id));
+  if (missing.length > 0) {
+    throw new IneligibleSourceError(missing);
+  }
+
+  // 3. Build the publisher payment breakdown from canonical DB values,
+  //    preserving the requested chunk order.
   const breakdownMap = new Map<string, PublisherPaymentBreakdown>();
-  for (const chunk of matchedChunks) {
+  const orderedAuthoritative: ChunkRecord[] = [];
+  for (const id of uniqueRequestedIds) {
+    orderedAuthoritative.push(byId.get(id)!);
+  }
+
+  for (const chunk of orderedAuthoritative) {
     const key = chunk.publisher_wallet;
     let entry = breakdownMap.get(key);
 
@@ -105,8 +213,9 @@ export async function createPaymentQuote(
       continue;
     }
 
-    // Find or create a document contribution within this publisher entry.
-    const docContribution = entry.documents.find((d) => d.document_id === chunk.document_id);
+    const docContribution = entry.documents.find(
+      (d) => d.document_id === chunk.document_id
+    );
     if (!docContribution) {
       const baseUnits = parseNumericPrice(chunk.price_per_query_usdc);
       if (baseUnits > MAX_PRICE_USDC) {
@@ -130,111 +239,148 @@ export async function createPaymentQuote(
     }
   }
 
-  const publisherBreakdown = Array.from(breakdownMap.values());
+  publisherBreakdown = Array.from(breakdownMap.values());
 
   // All money is summed in integer base units so the total can never drift
   // from the sum of its parts.
-  const totalBaseUnits = publisherBreakdown.reduce(
+  totalBaseUnits = publisherBreakdown.reduce(
     (sum: bigint, p) => sum + p.amount_base_units,
     BigInt(0)
   );
-  const totalPriceUsdc = fromBaseUnits(totalBaseUnits);
+  totalPriceUsdc = fromBaseUnits(totalBaseUnits);
 
-  // Digest over the exact chunk hashes that were priced.
-  const sourceDigest = computeSourceDigest(matchedChunks.map((c) => c.content_hash));
-
+  // Digest over the canonical chunk hashes that were priced.
+  const sourceDigest = computeSourceDigest(
+    orderedAuthoritative.map((c) => c.content_hash)
+  );
   const memoExpected = buildMemoPayload({
     quoteId,
     quoteNonce,
     sourceDigest,
   });
 
-  const expiresAt = new Date(Date.now() + expirySeconds * 1000).toISOString();
+  // Test-only pause: freeze after FOR SHARE locks are acquired, before
+  // inserting quote/snapshot rows. The transaction holds its locks while
+  // paused, allowing concurrency tests to observe real PostgreSQL blocking.
+  if (pauseBeforeInsert) {
+    await new Promise<void>((resolve) => {
+      pauseBeforeInsert(resolve);
+    });
+  }
 
-  const quoteRow = await withTransaction(async (client) => {
-    const insertSql = `
-      INSERT INTO payment_quotes (
-        id, quote_nonce, query_text, matched_chunk_ids, publisher_breakdown,
-        total_price_usdc, memo_expected, buyer_wallet, expires_at, status
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING')
-      RETURNING *;
-    `;
+  // 4. Insert the quote inside the same transaction.
+  const insertSql = `
+    INSERT INTO payment_quotes (
+      id, quote_nonce, query_text, matched_chunk_ids, publisher_breakdown,
+      total_price_usdc, memo_expected, buyer_wallet, expires_at, status
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING')
+    RETURNING *;
+  `;
 
-    const res = await client.query(insertSql, [
-      quoteId,
-      quoteNonce,
-      queryText,
-      JSON.stringify(matchedChunks.map((c) => c.id)),
-      JSON.stringify(
-        publisherBreakdown.map((p) => ({
-          ...p,
-          amount_base_units: p.amount_base_units.toString(),
-          documents: p.documents.map((d) => ({
-            ...d,
-            amount_base_units: d.amount_base_units.toString(),
-          })),
-        }))
-      ),
-      formatUsdc(totalBaseUnits),
-      memoExpected,
-      buyerWallet,
-      expiresAt,
-    ]);
+  const res = await client.query(insertSql, [
+    quoteId,
+    quoteNonce,
+    queryText,
+    JSON.stringify(uniqueRequestedIds),
+    JSON.stringify(
+      publisherBreakdown.map((p) => ({
+        ...p,
+        amount_base_units: p.amount_base_units.toString(),
+        documents: p.documents.map((d) => ({
+          ...d,
+          amount_base_units: d.amount_base_units.toString(),
+        })),
+      }))
+    ),
+    formatUsdc(totalBaseUnits),
+    memoExpected,
+    buyerWallet,
+    expiresAt,
+  ]);
 
-    // Insert immutable source snapshots for every priced chunk.
-    // Snapshots are write-once: they capture the exact content that was quoted
-    // and are never exposed through public APIs.
-    const sourceInsertSql = `
-      INSERT INTO payment_quote_sources (
-        id, quote_id, ordinal, chunk_id, document_id, publisher_id,
-        publisher_wallet, document_title, source_content, source_sha256,
-        document_price_base_units
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    `;
+  // 5. Insert immutable source snapshots inside the same transaction.
+  //    Content, hash, and price all come from the canonical DB record.
+  const sourceInsertSql = `
+    INSERT INTO payment_quote_sources (
+      id, quote_id, ordinal, chunk_id, document_id, publisher_id,
+      publisher_wallet, document_title, source_content, source_sha256,
+      document_price_base_units
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+  `;
 
-    let ordinal = 0;
-    for (const chunk of matchedChunks) {
-      // Recalculate SHA-256 from actual content and reject if it doesn't match
-      // the stored content_hash. This prevents a publisher from smuggling
-      // modified content by providing a false hash.
-      const recalculatedHash = computeSha256(chunk.content);
-      if (recalculatedHash !== chunk.content_hash) {
-        throw new Error(
-          `Source integrity check failed for chunk ${chunk.id}: content hash mismatch. Stored hash ${chunk.content_hash} does not match recomputed hash ${recalculatedHash}.`
-        );
-      }
-
-      await client.query(sourceInsertSql, [
-        `src_${crypto.randomUUID()}`,
-        quoteId,
-        ordinal++,
-        chunk.id,
-        chunk.document_id,
-        chunk.publisher_id,
-        chunk.publisher_wallet,
-        chunk.document_title,
-        chunk.content,
-        recalculatedHash,
-        BigInt(parseNumericPrice(chunk.price_per_query_usdc)),
-      ]);
+  let ordinal = 0;
+  for (const chunk of orderedAuthoritative) {
+    // Recalculate SHA-256 from current DB content and reject if it doesn't
+    // match the stored content_hash.
+    const recalculatedHash = computeSha256(chunk.content);
+    if (recalculatedHash !== chunk.content_hash) {
+      throw new Error(
+        `Source integrity check failed for chunk ${chunk.id}: content hash mismatch. Stored hash ${chunk.content_hash} does not match recomputed hash ${recalculatedHash}.`
+      );
     }
 
-    return res.rows[0];
+    await client.query(sourceInsertSql, [
+      `src_${crypto.randomUUID()}`,
+      quoteId,
+      ordinal++,
+      chunk.id,
+      chunk.document_id,
+      chunk.publisher_id,
+      chunk.publisher_wallet,
+      chunk.document_title,
+      chunk.content,
+      recalculatedHash,
+      BigInt(parseNumericPrice(chunk.price_per_query_usdc)),
+    ]);
+  }
+
+  return {
+    quoteRow: res.rows[0],
+    publisherBreakdown,
+    totalBaseUnits,
+    totalPriceUsdc,
+  };
+}
+
+export async function createPaymentQuote(
+  queryText: string,
+  matchedChunks: ChunkRecord[],
+  buyerWallet: string | null = null,
+  expirySeconds: number = config.quoteExpirySeconds
+): Promise<PaymentQuote> {
+  if (matchedChunks.length === 0) {
+    throw new Error('Cannot create quote with zero matched chunks.');
+  }
+
+  // matchedChunks is used only to identify the requested chunk IDs and to
+  // preserve their intended ordering. All authoritative data (price, wallet,
+  // publisher identity, document title, content, hashes) is loaded from the
+  // database inside the transaction below. Caller-supplied metadata is never
+  // trusted as a source of truth for pricing or allocation.
+
+  const result = await withTransaction(async (client) => {
+    return runQuoteTransaction(
+      client,
+      queryText,
+      matchedChunks,
+      buyerWallet,
+      expirySeconds
+    );
   });
 
   return {
-    id: quoteRow.id,
-    quote_nonce: quoteRow.quote_nonce,
-    query_text: quoteRow.query_text,
-    matched_chunk_ids: quoteRow.matched_chunk_ids,
-    publisher_breakdown: publisherBreakdown,
-    total_price_usdc: totalPriceUsdc,
-    total_base_units: totalBaseUnits,
-    memo_expected: quoteRow.memo_expected,
-    buyer_wallet: quoteRow.buyer_wallet,
-    expires_at: quoteRow.expires_at,
-    status: quoteRow.status,
-    created_at: quoteRow.created_at,
+    id: result.quoteRow.id,
+    quote_nonce: result.quoteRow.quote_nonce,
+    query_text: result.quoteRow.query_text,
+    matched_chunk_ids: result.quoteRow.matched_chunk_ids,
+    publisher_breakdown: result.publisherBreakdown,
+    total_price_usdc: result.totalPriceUsdc,
+    total_base_units: result.totalBaseUnits,
+    memo_expected: result.quoteRow.memo_expected,
+    buyer_wallet: result.quoteRow.buyer_wallet,
+    expires_at: result.quoteRow.expires_at,
+    status: result.quoteRow.status,
+    created_at: result.quoteRow.created_at,
   };
 }
 
